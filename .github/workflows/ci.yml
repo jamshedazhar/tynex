@@ -1,0 +1,186 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Queue main runs so the release commit cannot cancel the run that created it.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: check (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.12", "3.13", "3.14"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv and Python ${{ matrix.python }}
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: "0.12.17"
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+
+      - name: Install the project
+        run: uv sync --locked --python ${{ matrix.python }}
+
+      - name: Lint
+        run: uv run ruff check --output-format=github .
+
+      - name: Check formatting
+        run: uv run ruff format --check .
+
+      - name: Test
+        run: uv run pytest -q
+
+  # Publish on every push to main. If the current version is already on PyPI,
+  # bump the patch version, commit it, and publish that instead. The commit is
+  # pushed with GITHUB_TOKEN, which does not start another workflow, so this
+  # run is the only publisher.
+  release:
+    name: Release
+    needs: check
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    outputs:
+      skip: ${{ steps.prepare.outputs.skip }}
+      version: ${{ steps.prepare.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: "0.12.17"
+          enable-cache: false
+
+      - name: Prepare release
+        id: prepare
+        run: |
+          set -euo pipefail
+          echo "skip=false" >> "${GITHUB_OUTPUT}"
+          echo "bump=false" >> "${GITHUB_OUTPUT}"
+
+          version=$(sed -n 's/^__version__ = "\([^"]*\)"$/\1/p' src/tynex/__init__.py | head -n1)
+          if [ -z "${version}" ]; then
+            echo "::error::Could not read __version__ from src/tynex/__init__.py"
+            exit 1
+          fi
+
+          pypi_project="tynex"
+          pypi_has_version() {
+            local candidate="$1"
+            if ! curl -fsSL --retry 3 --retry-delay 2 \
+              "https://pypi.org/pypi/${pypi_project}/json" -o /tmp/tynex-pypi.json; then
+              return 1
+            fi
+            python3 -c 'import json, sys; data = json.load(open("/tmp/tynex-pypi.json", encoding="utf-8")); raise SystemExit(0 if sys.argv[1] in data.get("releases", {}) else 1)' "${candidate}"
+          }
+
+          bump=false
+          # GITHUB_TOKEN pushes do not start other workflows, but this keeps
+          # manual re-runs of a release commit idempotent.
+          is_release_commit=false
+          if git log -1 --pretty=%s | grep -q '^chore(release):'; then
+            is_release_commit=true
+          fi
+
+          if pypi_has_version "${version}"; then
+            if [ "${is_release_commit}" = "true" ]; then
+              echo "Version ${version} is already on PyPI; nothing to do."
+              echo "skip=true" >> "${GITHUB_OUTPUT}"
+              exit 0
+            fi
+
+            if ! [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::Cannot auto-bump ${version}; bump __version__ manually."
+              exit 1
+            fi
+
+            base=${version%.*}
+            patch=${version##*.}
+            while pypi_has_version "${base}.${patch}"; do
+              patch=$((patch + 1))
+            done
+            version="${base}.${patch}"
+            bump=true
+
+            sed -i "s/^__version__ = \"[^\"]*\"$/__version__ = \"${version}\"/" src/tynex/__init__.py
+            if ! grep -q "^__version__ = \"${version}\"$" src/tynex/__init__.py; then
+              echo "::error::Failed to update __version__ to ${version}"
+              exit 1
+            fi
+          fi
+
+          echo "bump=${bump}" >> "${GITHUB_OUTPUT}"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "Prepared version ${version}"
+
+      - name: Build
+        if: steps.prepare.outputs.skip != 'true'
+        run: uv build
+
+      - name: Commit version bump
+        if: steps.prepare.outputs.bump == 'true'
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/tynex/__init__.py
+          git commit -m "chore(release): v${{ steps.prepare.outputs.version }}"
+          git push origin "HEAD:main"
+
+      - name: Upload distributions
+        if: steps.prepare.outputs.skip != 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    name: Publish to PyPI
+    needs: release
+    if: needs.release.result == 'success' && needs.release.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/p/tynex
+    permissions:
+      id-token: write
+    steps:
+      - name: Install uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: "0.12.17"
+          enable-cache: false
+
+      - name: Download distributions
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish
+        run: uv publish

@@ -1,0 +1,152 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tynex"
+dynamic = ["version"]
+description = "Tynex — a minimal, auditable terminal coding agent harness in Python"
+readme = "README.md"
+# The whole harness needs Python 3.12+ (`ripgrep-rs` ships wheels from cp312 on);
+# there is no upper bound.
+requires-python = ">=3.12"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "Tynex contributors" }]
+maintainers = [{ name = "Tynex contributors" }]
+keywords = [
+    "tynex",
+    "agent",
+    "ai",
+    "cli",
+    "llm",
+    "coding-agent",
+    "agent-harness",
+    "developer-tools",
+    "terminal",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Terminals",
+    "Topic :: Utilities",
+]
+# Keep the base install lean: the embedding SDK needs the HTTP adapter (which
+# also powers keyless web search and page reading) and the in-process search
+# engine behind grep/find/ls. Everything a terminal user expects (CLI parser,
+# TUI) lives in the `cli` extra below.
+dependencies = [
+    "httpx2>=2.10.0",
+    "ripgrep-rs>=0.4.2",
+]
+
+[project.optional-dependencies]
+# `pip install 'tynex[cli]'` — the full terminal harness, TUI included.
+cli = [
+    "click>=8.3.0",
+    "prompt_toolkit>=3.0.53",
+    "rich>=15.0.0",
+]
+
+[project.scripts]
+tynex = "tynex.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/jamshedazhar/tynex#readme"
+Repository = "https://github.com/jamshedazhar/tynex"
+Issues = "https://github.com/jamshedazhar/tynex/issues"
+Changelog = "https://github.com/jamshedazhar/tynex/releases"
+
+[dependency-groups]
+# Mirrors [project.optional-dependencies].cli so `uv sync` installs the full
+# harness.
+cli = [
+    "click>=8.3.0",
+    "prompt_toolkit>=3.0.53",
+    "rich>=15.0.0",
+]
+dev = [
+    {include-group = "cli"},
+    "pytest>=9.0.0",
+    "coverage>=7.16.0",
+    "ruff>=0.16.0",
+]
+
+[tool.hatch.version]
+path = "src/tynex/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tynex"]
+
+[tool.hatch.build.targets.sdist]
+only-include = [
+    "/src/tynex",
+    "/LICENSE",
+    "/NOTICE",
+    "/README.md",
+    "/pyproject.toml",
+]
+exclude = ["**/__pycache__", "**/*.py[cod]"]
+
+[tool.uv]
+required-version = ">=0.12"
+# Supply-chain pin: resolve only releases published before this timestamp.
+# Bump it deliberately before upgrading dependencies.
+exclude-newer = "2026-10-10T00:00:00Z"
+default-groups = ["dev"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+src = ["src", "tests"]
+# README code samples are hand-formatted, and agent/settings.json is
+# hand-formatted data: keep the linter and formatter out of Markdown and JSON.
+extend-exclude = ["*.md", "*.json"]
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "UP", "B", "C4", "SIM", "RUF"]
+# E501 is intentionally disabled: `ruff format` wraps code to `line-length`,
+# but it cannot split long string literals or comments.
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["tynex", "tests"]
+split-on-trailing-comma = false
+
+[tool.ruff.format]
+quote-style = "double"
+docstring-code-format = true
+skip-magic-trailing-comma = true
+
+[tool.pytest.ini_options]
+minversion = "9.0"
+testpaths = ["tests"]
+addopts = "-ra --strict-markers --strict-config"
+xfail_strict = true
+
+[tool.coverage.run]
+branch = true
+relative_files = true
+source = ["tynex"]
+
+[tool.coverage.report]
+precision = 2
+show_missing = true
+skip_covered = true
+fail_under = 80
+exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:", "raise NotImplementedError"]
+
+[tool.coverage.html]
+directory = "htmlcov"
+
+[tool.coverage.xml]
+output = "coverage.xml"

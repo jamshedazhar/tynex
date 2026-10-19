@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "context7": {
+      "url": "https://mcp.context7.com/mcp",
+      "enabled": true,
+      "description": "Up-to-date, version-specific library documentation",
+      "homepage": "https://context7.com"
+    }
+  }
+}
