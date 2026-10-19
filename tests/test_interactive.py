@@ -37,6 +37,9 @@ from tynex.tui.app import InteractiveApp
 from tynex.tui.prompt import _prompt_key_bindings
 from tynex.tui.renderer import Renderer, display_cwd, footer_text, running_text
 
+# Keep Rich from wrapping long temporary paths differently on each platform.
+CONSOLE_WIDTH = 300
+
 
 class FakePrompt:
     """Stands in for the prompt_toolkit session in ``InteractiveApp._input``."""
@@ -71,9 +74,9 @@ def make_app(
 ) -> InteractiveApp:
     session = AgentSession(cwd=str(tmp_path), model=model, tool_names=tool_names or [], no_session=True)
     if terminal:
-        console = Console(file=io.StringIO(), force_terminal=True, no_color=True, highlight=False, width=110)
+        console = Console(file=io.StringIO(), force_terminal=True, no_color=True, highlight=False, width=CONSOLE_WIDTH)
     else:
-        console = Console(file=io.StringIO(), width=110, highlight=False)
+        console = Console(file=io.StringIO(), width=CONSOLE_WIDTH, highlight=False)
     return InteractiveApp(session, console=console)
 
 
@@ -89,7 +92,7 @@ def output(app: InteractiveApp) -> str:
 def make_renderer(tmp_path: Path, **session_kwargs: Any) -> tuple[Renderer, io.StringIO]:
     session = AgentSession(cwd=str(tmp_path), tool_names=[], no_session=True, **session_kwargs)
     buffer = io.StringIO()
-    console = Console(file=buffer, width=110, highlight=False)
+    console = Console(file=buffer, width=CONSOLE_WIDTH, highlight=False)
     return Renderer(session, console), buffer
 
 
@@ -1174,7 +1177,7 @@ def make_persistent_app(tmp_path: Path, *, session_file: str = "session.jsonl") 
     session = AgentSession(
         cwd=str(tmp_path), model=resolve_model("faux/test"), tool_names=[], session_file=str(tmp_path / session_file)
     )
-    console = Console(file=io.StringIO(), width=110, highlight=False)
+    console = Console(file=io.StringIO(), width=CONSOLE_WIDTH, highlight=False)
     return InteractiveApp(session, console=console)
 
 
@@ -1253,7 +1256,7 @@ def test_budget_command_shows_limits_and_hides_unused_rows(tmp_path):
     assert "Budget" not in out and "$0.0000" not in out  # no limits, no usage: nothing to show
 
     session = AgentSession(cwd=str(tmp_path), tool_names=[], no_session=True, budget=BudgetLimits(max_tokens=5))
-    limited = InteractiveApp(session, console=Console(file=io.StringIO(), width=110, highlight=False))
+    limited = InteractiveApp(session, console=Console(file=io.StringIO(), width=CONSOLE_WIDTH, highlight=False))
     limited._handle_command("/budget")
     out = limited.console.file.getvalue()
     assert "tokens" in out and "0 / 5" in out
@@ -1318,7 +1321,7 @@ def test_fork_uses_a_picker_on_a_terminal(tmp_path, monkeypatch):
     app = make_persistent_app(tmp_path)
     append_exchange(app, "first question", "first answer")
     append_exchange(app, "second question", "second answer")
-    app.console = Console(file=io.StringIO(), force_terminal=True, no_color=True, highlight=False, width=110)
+    app.console = Console(file=io.StringIO(), force_terminal=True, no_color=True, highlight=False, width=CONSOLE_WIDTH)
     seen: dict[str, Any] = {}
 
     def fake_select(title, options, *, selected=0):
@@ -1338,7 +1341,7 @@ def test_fork_picker_interrupt_does_not_fork(tmp_path, monkeypatch):
     # fork before the last candidate.
     app = make_persistent_app(tmp_path)
     append_exchange(app, "first question", "first answer")
-    app.console = Console(file=io.StringIO(), force_terminal=True, no_color=True, highlight=False, width=110)
+    app.console = Console(file=io.StringIO(), force_terminal=True, no_color=True, highlight=False, width=CONSOLE_WIDTH)
     session_id = app.session.session.session_id
 
     def interrupted(title: str, options: list[str], *, selected: int = 0) -> int:
