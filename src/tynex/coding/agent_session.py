@@ -9,7 +9,6 @@ import traceback
 import uuid
 from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass
 from typing import Any
 
 from tynex.agent.budget import BudgetLimits, BudgetState
@@ -25,24 +24,19 @@ from tynex.agent.types import (
 )
 from tynex.ai import providers
 from tynex.ai.models import Model, default_model_for_provider, format_model
-from tynex.ai.providers.base import THINKING_LEVELS, LlmContext, StreamOptions
+from tynex.ai.providers.base import THINKING_LEVELS, clamp_thinking
 from tynex.ai.types import (
     AbortSignal,
     AssistantMessage,
     BashExecutionMessage,
-    ImageContent,
     Message,
     SystemMessage,
-    TextContent,
-    ThinkingContent,
-    ToolCall,
-    ToolResultMessage,
     Usage,
     UserMessage,
     bash_execution_to_text,
-    message_text,
 )
 from tynex.coding.checkpoints import CheckpointGroup, CheckpointStore
+from tynex.coding.compaction import CompactionResult, compact, estimate_message_tokens, estimate_tokens
 from tynex.coding.mcp_settings import McpServerConfig, resolve_mcp_servers
 from tynex.coding.mcp_tools import McpManager
 from tynex.coding.model_catalog import ensure_models, resolve_model_retry
@@ -53,13 +47,15 @@ from tynex.coding.signin import register_copilot_provider
 from tynex.coding.skills import PromptTemplate, discover_prompts, discover_skills, format_skills_for_prompt
 from tynex.coding.system_prompt import build_system_prompt, load_context_files, load_system_md
 from tynex.coding.tools import DEFAULT_TOOL_NAMES, create_tools
+from tynex.coding.tools.plan import PLAN_TOOL_NAME
 from tynex.coding.tools.shell import ShellTool
 
 EventSink = Callable[[dict[str, Any]], None]
 
 PLAN_MODE_NOTE = (
-    "Plan mode is active (permission mode 'plan'): investigate with read-only tools and present a plan. "
-    "File writes, edits and shell commands are denied until the user switches permission modes."
+    "Plan mode is active (permission mode 'plan'): investigate with read-only tools, then call "
+    "submit_plan with the complete plan. File writes, edits and shell commands are denied until the "
+    "user approves the plan. Do not ask whether to proceed in a message; the plan is the approval request."
 )
 
 
@@ -106,8 +102,7 @@ class AgentSession:
             else (self.session.thinking_level() or self.settings.get("thinking") or "off")
         )
         available = self.available_thinking_levels()
-        level = str(level).strip().lower()
-        self.thinking = level if level in available else available[0]
+        self.thinking = clamp_thinking(str(level).strip().lower(), available)
         # Tools
         names = tool_names if tool_names is not None else list(DEFAULT_TOOL_NAMES)
         self.tools: list[AgentTool] = create_tools(self.cwd, names)
@@ -176,6 +171,18 @@ class AgentSession:
         self._active_sink: EventSink | None = None
         self._lock = threading.RLock()
         self._running = False
+        # Caches for values the TUI reads on every repaint. The session only
+        # appends, so entry counts grow monotonically; usage accumulates as
+        # turns finish. Both are reset when the session file changes.
+        self._usage: Usage | None = None
+        self._counts: tuple[int, dict[str, int], int] | None = None
+        self._prompt_cache: tuple[tuple[int, str], str] | None = None
+        self._llm_cache: tuple[Message | None, int, Message | None, str, list[Message]] | None = None
+        self._token_cache: tuple[Message | None, int, Message | None, int] | None = None
+        # The plan/approve gate: set while a submitted plan awaits a decision.
+        self.pending_plan: dict[str, Any] | None = None
+        self._submitted_plan = ""
+        self._restore_pending_plan()
         self.extensions.run_hook("session_start", {"session": self})
 
     # -- setup helpers -------------------------------------------------------
@@ -209,6 +216,15 @@ class AgentSession:
         return None
 
     def system_prompt_text(self) -> str:
+        """The full system prompt, rebuilt only when its inputs change."""
+        key = (len(self.tools), self.permission_gate.mode)
+        if self._prompt_cache is not None and self._prompt_cache[0] == key:
+            return self._prompt_cache[1]
+        text = self._build_system_prompt()
+        self._prompt_cache = (key, text)
+        return text
+
+    def _build_system_prompt(self) -> str:
         skills_lines = format_skills_for_prompt(self.skills, "read")
         extra_sections = dict(self.extensions.prompt_sections)
         if self.permission_gate.mode == "plan":
@@ -278,19 +294,60 @@ class AgentSession:
         self.budget.steps += 1
         return None
 
+    @staticmethod
+    def _convert_message(message: Message) -> Message | None:
+        """The provider-facing form of one message; ``None`` means it is omitted."""
+        if isinstance(message, SystemMessage):
+            return None
+        if isinstance(message, BashExecutionMessage):
+            # ``!!`` executions stay in the transcript but never reach the model.
+            if message.exclude_from_context:
+                return None
+            return UserMessage(content=bash_execution_to_text(message), timestamp=message.timestamp)
+        return message
+
+    @staticmethod
+    def _cached_prefix(messages: list[Message], cache: tuple | None, limit: int) -> int:
+        """Length of the cached prefix that still matches ``messages``, else 0.
+
+        ``run_agent_loop`` rebuilds the message list every turn, so comparing
+        list identity would never hit. The transcript is append-only, so the
+        first message plus the last prefix message identify it: holding both
+        objects also keeps their ids stable for the comparison.
+        """
+        if cache is None or not messages or cache[1] > limit:
+            return 0
+        if messages[0] is not cache[0]:
+            return 0
+        return cache[1] if cache[1] == 0 or messages[cache[1] - 1] is cache[2] else 0
+
     def _convert_to_llm(self, messages: list[Message]) -> list[Message]:
+        """Convert the conversation for one request, reusing the stable prefix.
+
+        The history is append-only and only the last message can still change
+        while a turn streams, so everything before it keeps its conversion.
+        Without this, every model call rebuilt thousands of messages.
+        """
         system = SystemMessage(content=self.system_prompt_text())
-        converted: list[Message] = []
-        for message in messages:
-            if isinstance(message, SystemMessage):
-                continue
-            if isinstance(message, BashExecutionMessage):
-                # ``!!`` executions stay in the transcript but never reach the model.
-                if message.exclude_from_context:
-                    continue
-                converted.append(UserMessage(content=bash_execution_to_text(message), timestamp=message.timestamp))
-                continue
-            converted.append(message)
+        prefix_len = max(0, len(messages) - 1)
+        cache = self._llm_cache
+        start = self._cached_prefix(messages, cache, prefix_len)
+        if start and cache is not None and cache[3] == system.content:
+            converted = list(cache[4])
+        else:
+            start, converted = 0, []
+        for message in messages[start:prefix_len]:
+            if (converted_message := self._convert_message(message)) is not None:
+                converted.append(converted_message)
+        self._llm_cache = (
+            messages[0] if messages else None,
+            prefix_len,
+            messages[prefix_len - 1] if prefix_len else None,
+            system.content,
+            list(converted),
+        )
+        if messages and (last := self._convert_message(messages[-1])) is not None:
+            converted.append(last)
         return [system, *converted]
 
     # -- queues ---------------------------------------------------------------
@@ -338,72 +395,33 @@ class AgentSession:
         with self._lock:
             return len(self._steering)
 
+    def _install_session(self, session: SessionManager, messages: list[Message]) -> None:
+        """Adopt a session file and rebuild everything that hangs off it."""
+        self.session = session
+        self.context = AgentContext(messages=messages, tools=self.tools)
+        self.budget.reset()
+        self._usage = None
+        self._counts = None
+        self._llm_cache = None
+        self._token_cache = None
+        self.pending_plan = None
+        self._submitted_plan = ""
+        self._bind_checkpoints()
+        self._restore_pending_plan()
+
     def switch_session(self, session_file: str) -> None:
         """Load a different session file and rebuild the conversation."""
-        self.session = SessionManager(self.cwd, session_file=session_file)
-        change = self.session.selection()
+        session = SessionManager(self.cwd, session_file=session_file)
+        self._install_session(session, session.branch_messages())
+        change = session.selection()
         if change:
             with contextlib.suppress(ValueError):
                 self.set_model(resolve_model_retry(f"{change[0]}/{change[1]}", self.settings))
-        self.context = AgentContext(messages=self.session.branch_messages(), tools=self.tools)
-        self.budget.reset()
-        self._bind_checkpoints()
 
     def new_session(self) -> None:
-        self.session = SessionManager(self.cwd)
-        self.context = AgentContext(messages=[], tools=self.tools)
-        self.budget.reset()
-        self._bind_checkpoints()
+        self._install_session(SessionManager(self.cwd), [])
         if self.model is not None:
             self.session.append_model_change(self.model.provider, self.model.id)
-
-    # -- fork / clone -----------------------------------------------------------
-    def _replace_session(self, session_file: str | None) -> None:
-        if session_file is None:
-            self.context = AgentContext(messages=self.session.branch_messages(), tools=self.tools)
-        else:
-            self.session = SessionManager(self.cwd, session_file=session_file)
-            self.context = AgentContext(messages=self.session.branch_messages(), tools=self.tools)
-        self.budget.reset()
-        self._bind_checkpoints()
-
-    def clone_session(self) -> str | None:
-        """Duplicate the session at its current position."""
-        leaf = self.session.current_leaf_id
-        if leaf is None:
-            return None
-        new_file = self.session.create_branched_session(leaf)
-        self._replace_session(new_file)
-        return new_file
-
-    def user_messages_for_forking(self) -> list[tuple[str, str]]:
-        """User messages in the session file that ``/fork`` can branch from."""
-        found: list[tuple[str, str]] = []
-        for entry in self.session.entries:
-            if entry.type != "message":
-                continue
-            message = entry.message
-            if message is None or getattr(message, "role", None) != "user":
-                continue
-            text = message_text(message)
-            if text.strip():
-                found.append((entry.id, text))
-        return found
-
-    def fork_session(self, entry_id: str) -> tuple[str | None, str]:
-        """Fork before the user message ``entry_id``."""
-        entry = self.session.find_entry(entry_id)
-        if entry is None or entry.type != "message" or getattr(entry.message, "role", None) != "user":
-            raise ValueError("Invalid entry ID for forking")
-        selected = message_text(entry.message)
-        # Forking before the first user message means branching at its parent
-        # (usually the session header), i.e. an empty conversation.
-        target = entry.parent_id or self.session.header_id
-        if target is None:
-            raise ValueError("Invalid entry ID for forking")
-        new_file = self.session.create_branched_session(target)
-        self._replace_session(new_file)
-        return new_file, selected
 
     # -- prompt ---------------------------------------------------------------
     def prompt(self, content: str | list, emit: EventSink | None = None) -> list[Message]:
@@ -477,9 +495,16 @@ class AgentSession:
                 if isinstance(message, AssistantMessage):
                     self.budget.add_usage(message.usage)
                     self.budget.tool_calls += len(message.tool_calls())
+                    if self._usage is not None:
+                        self._usage.add(message.usage)
                 if message is not None and not isinstance(message, SystemMessage):
                     self.session.append_message(message)
-            if etype == "agent_end":
+            elif etype == "tool_execution_end" and event.get("toolName") == PLAN_TOOL_NAME:
+                if event.get("isError"):
+                    self._submitted_plan = ""
+                else:
+                    self._record_submitted_plan()
+            elif etype == "agent_end":
                 self.extensions.run_hook("agent_end", {"session": self, "messages": event.get("messages", [])})
             if user_emit:
                 user_emit(event)
@@ -493,14 +518,52 @@ class AgentSession:
         return max(4_000, self.model.context_window - reserve)
 
     def estimate_context_tokens(self) -> int:
+        """Approximate the tokens the next request would send.
+
+        ``usage.input`` excludes cached tokens: Anthropic reports cache reads and
+        writes separately, and OpenAI/Google/Copilot subtract ``cached_tokens``
+        from ``prompt_tokens``. The real prompt size is therefore
+        ``input + cache_read + cache_write``, which already covers the system
+        prompt and the tool schemas — so only the messages recorded after the
+        measured turn are estimated on top of it. The text heuristic stays as a
+        floor so providers that under-report (faux, a missing system prompt) do
+        not hide context growth.
+        """
         system_tokens = len(self.system_prompt_text()) // 4
         messages = self.context.messages
+        heuristic = self._estimate_history(messages) + system_tokens
         for i in range(len(messages) - 1, -1, -1):
             message = messages[i]
-            if isinstance(message, AssistantMessage) and (message.usage.input or message.usage.total_tokens):
-                base = message.usage.input + message.usage.cache_read + message.usage.output
-                return base + estimate_tokens(messages[i + 1 :]) + system_tokens
-        return estimate_tokens(messages) + system_tokens
+            if not isinstance(message, AssistantMessage):
+                continue
+            usage = message.usage
+            prompt_tokens = usage.input + usage.cache_read + usage.cache_write
+            if not prompt_tokens:
+                # Some providers only report a combined total that includes output.
+                prompt_tokens = max(0, usage.total_tokens - usage.output)
+            if not prompt_tokens:
+                continue
+            measured = prompt_tokens + usage.output + estimate_tokens(messages[i + 1 :])
+            return max(measured, heuristic)
+        return heuristic
+
+    def _estimate_history(self, messages: list[Message]) -> int:
+        """Token estimate for the conversation, reusing the stable prefix.
+
+        Only the last message can still change while a turn streams, so it is
+        always re-estimated; everything before it is append-only. Tail slices
+        (post-compaction) are small and measured directly.
+        """
+        if messages is not self.context.messages:
+            return estimate_tokens(messages)
+        stable = max(0, len(messages) - 1)
+        cache = self._token_cache
+        start = self._cached_prefix(messages, cache, stable)
+        total = cache[3] if start and cache is not None else 0
+        for message in messages[start:stable]:
+            total += estimate_message_tokens(message)
+        self._token_cache = (messages[0] if messages else None, stable, messages[stable - 1] if stable else None, total)
+        return total + (estimate_message_tokens(messages[-1]) if messages else 0)
 
     def _prepare_next_turn(self, _last_turn: PrepareNextTurnContext) -> PrepareNextTurnResult | None:
         try:
@@ -557,10 +620,16 @@ class AgentSession:
 
     # -- thinking level ---------------------------------------------------------
     def available_thinking_levels(self) -> list[str]:
-        """Thinking levels the current model accepts."""
+        """Thinking levels the current model accepts.
+
+        ``off`` is always available; a catalog that lists effort levels narrows
+        the rest to what the model actually takes.
+        """
         if self.model is None or not self.model.reasoning:
             return ["off"]
-        return list(THINKING_LEVELS)
+        declared = set(self.model.thinking_levels)
+        levels = [level for level in THINKING_LEVELS if level == "off" or not declared or level in declared]
+        return levels or ["off"]
 
     def set_thinking(self, level: str) -> str:
         """Set the thinking level and record a ``thinking_level_change`` entry."""
@@ -568,7 +637,7 @@ class AgentSession:
         normalized = level.strip().lower()
         if normalized not in THINKING_LEVELS:
             raise ValueError(f'Unknown thinking level "{level}". Available levels: {", ".join(available)}.')
-        effective = normalized if normalized in available else available[0]
+        effective = clamp_thinking(normalized, available)
         if effective != self.thinking:
             self.thinking = effective
             self.session.append_thinking_level_change(effective)
@@ -581,6 +650,20 @@ class AgentSession:
             return blocked
         tool = payload.get("tool")
         args = payload.get("args") or {}
+        if getattr(tool, "name", "") == PLAN_TOOL_NAME:
+            # The tool is part of the gate, not a way around it: outside plan
+            # mode there is nothing to approve, and plan mode stays read-only.
+            if self.permission_gate.mode != "plan":
+                return {
+                    "block": True,
+                    "reason": "submit_plan is only available in plan mode — switch with /permissions plan.",
+                }
+            if self.pending_plan is not None:
+                return {
+                    "block": True,
+                    "reason": "A plan is already waiting for approval — approve or reject it before submitting another.",
+                }
+            self._submitted_plan = str(args.get("plan", "")).strip()
         decision = self.permission_gate.check(tool, args) if tool is not None else None
         if decision is not None:
             if not decision.allowed:
@@ -616,6 +699,54 @@ class AgentSession:
             self.session.append("permission", **entry)
         if self._active_sink is not None:
             self._active_sink({"type": "permission_decision", **entry})
+
+    # -- plan / approve -----------------------------------------------------------
+    def _record_submitted_plan(self) -> None:
+        """Persist a submitted plan and announce it; the decision happens outside the run."""
+        plan = self._submitted_plan
+        self._submitted_plan = ""
+        if not plan or self.pending_plan is not None:
+            return
+        entry = self.session.append("plan", plan=plan)
+        self.pending_plan = {"id": entry.id, "plan": plan}
+        if self._active_sink is not None:
+            self._active_sink({"type": "plan_ready", "planId": entry.id, "plan": plan})
+
+    def _restore_pending_plan(self) -> None:
+        """Resume a plan that was submitted but never approved or rejected.
+
+        The decision is part of the session, so quitting or switching sessions
+        must not silently drop an unreviewed plan.
+        """
+        plan: Any = None
+        decided = False
+        for entry in self.session.path_entries():
+            if entry.type == "plan":
+                plan, decided = entry, False
+            elif entry.type in ("plan_approved", "plan_rejected") and plan is not None:
+                decided = True
+        if plan is None or decided:
+            return
+        text = str(plan.data.get("plan") or "")
+        if text:
+            self.pending_plan = {"id": plan.id, "plan": text}
+
+    def approve_plan(self) -> dict[str, Any]:
+        """Accept the pending plan: switch to accept-edits and record the decision."""
+        if self.pending_plan is None:
+            raise ValueError("No plan is waiting for approval.")
+        plan = self.pending_plan
+        self.session.append("plan_approved", planId=plan["id"])
+        self.pending_plan = None
+        self.set_permission_mode("accept-edits")
+        return plan
+
+    def reject_plan(self, feedback: str = "") -> None:
+        """Decline the pending plan; plan mode stays active for a revision."""
+        if self.pending_plan is None:
+            raise ValueError("No plan is waiting for approval.")
+        self.session.append("plan_rejected", planId=self.pending_plan["id"], feedback=feedback)
+        self.pending_plan = None
 
     # -- permissions / budget -----------------------------------------------------
     def set_permission_mode(self, mode: str) -> str:
@@ -662,15 +793,19 @@ class AgentSession:
     # -- stats ----------------------------------------------------------------
     def usage_totals(self) -> Usage:
         """Token/cost totals over every assistant message in the session file."""
-        total = Usage()
-        for entry in self.session.entries:
-            message = entry.message
-            if isinstance(message, AssistantMessage):
-                total.add(message.usage)
-        total.total_tokens = total.input + total.output
-        return total
+        if self._usage is None:
+            total = Usage()
+            for entry in self.session.entries:
+                message = entry.message
+                if isinstance(message, AssistantMessage):
+                    total.add(message.usage)
+            self._usage = total
+        return self._usage
 
-    def stats(self) -> dict[str, Any]:
+    def _message_counts(self) -> tuple[dict[str, int], int]:
+        """Role counts and tool-call total, recomputed only when entries grow."""
+        if self._counts is not None and self._counts[0] == len(self.session.entries):
+            return self._counts[1], self._counts[2]
         counts = {"user": 0, "assistant": 0, "toolResult": 0}
         tool_calls = 0
         for entry in self.session.entries:
@@ -680,6 +815,11 @@ class AgentSession:
                 counts[role] += 1
             if isinstance(message, AssistantMessage):
                 tool_calls += len(message.tool_calls())
+        self._counts = (len(self.session.entries), counts, tool_calls)
+        return counts, tool_calls
+
+    def stats(self) -> dict[str, Any]:
+        counts, tool_calls = self._message_counts()
         usage = self.usage_totals()
         return {
             "sessionId": self.session.session_id,
@@ -705,166 +845,6 @@ class AgentSession:
 
     def session_label(self) -> str | None:
         return self.session.label
-
-
-DEFAULT_KEEP_TOKENS = 12_000
-MIN_MESSAGES_TO_COMPACT = 8
-
-SUMMARIZATION_SYSTEM = (
-    "You are a context summarization assistant. Your task is to summarize a coding session "
-    "transcript so another engineer (or agent) can continue the work without the original "
-    "conversation. Capture: the user's goal(s), key decisions made, files created or modified "
-    "(with paths), important context and constraints, current state of the work, and the "
-    "immediate next steps. Be concise but complete. Do not mention the summarization process."
-)
-
-
-@dataclass
-class CompactionResult:
-    summary: str
-    first_kept_entry_id: str
-    tokens_before: int
-    messages_summarized: int
-
-
-def estimate_message_tokens(message: Message) -> int:
-    if isinstance(message, SystemMessage):
-        return len(message.content) // 4 + 4
-    if isinstance(message, UserMessage):
-        if isinstance(message.content, str):
-            return len(message.content) // 4 + 4
-        total = 4
-        for part in message.content:
-            if isinstance(part, TextContent):
-                total += len(part.text) // 4
-            elif isinstance(part, ImageContent):
-                total += 800
-        return total
-    if isinstance(message, AssistantMessage):
-        total = 4
-        for part in message.content:
-            if isinstance(part, TextContent):
-                total += len(part.text) // 4
-            elif isinstance(part, ThinkingContent):
-                total += len(part.thinking) // 4
-            elif isinstance(part, ToolCall):
-                total += (len(part.name) + len(str(part.arguments))) // 4
-        return total
-    if isinstance(message, ToolResultMessage):
-        return sum(len(p.text) // 4 for p in message.content if isinstance(p, TextContent)) + 4
-    if isinstance(message, BashExecutionMessage):
-        return len(bash_execution_to_text(message)) // 4 + 4
-    return 4
-
-
-def estimate_tokens(messages: list[Message]) -> int:
-    return sum(estimate_message_tokens(m) for m in messages)
-
-
-def _render_transcript(messages: list[Message], max_chars: int = 400_000) -> str:
-    lines: list[str] = []
-    total = 0
-    for message in messages:
-        if isinstance(message, UserMessage):
-            body = message.text()
-            line = f"## User\n{body}"
-        elif isinstance(message, AssistantMessage):
-            parts: list[str] = []
-            for part in message.content:
-                if isinstance(part, TextContent) and part.text:
-                    parts.append(part.text)
-                elif isinstance(part, ToolCall):
-                    parts.append(f"[tool call] {part.name}({str(part.arguments)[:500]})")
-            line = "## Assistant\n" + "\n".join(parts)
-        elif isinstance(message, ToolResultMessage):
-            body = message.text()
-            line = f"## Tool result ({message.tool_name})\n{body[:4000]}"
-        elif isinstance(message, BashExecutionMessage):
-            line = f"## Shell\n{bash_execution_to_text(message)[:4000]}"
-        elif isinstance(message, SystemMessage):
-            line = f"## System\n{message.content[:2000]}"
-        else:
-            continue
-        if total + len(line) > max_chars:
-            break
-        lines.append(line)
-        total += len(line)
-    return "\n\n".join(lines)
-
-
-def _collect_text(stream_fn: Callable, model: Model, context: LlmContext, api_key: str | None) -> str:
-    options = StreamOptions(api_key=api_key, thinking="off")
-    last: AssistantMessage | None = None
-    for event in stream_fn(model, context, options):
-        partial = event.get("partial")
-        if isinstance(partial, AssistantMessage):
-            last = partial
-    return last.text().strip() if last else ""
-
-
-def compact(
-    session: SessionManager,
-    stream_fn: Callable,
-    model: Model,
-    api_key: str | None,
-    keep_tokens: int = DEFAULT_KEEP_TOKENS,
-    custom_instructions: str | None = None,
-) -> CompactionResult | None:
-    """Summarize older messages; returns None when there is nothing to compact."""
-    message_entries = [e for e in session.message_entries() if e.message is not None]
-    if len(message_entries) < MIN_MESSAGES_TO_COMPACT:
-        return None
-    # Walk backwards to find the kept window.
-    split = 0
-    tokens = 0
-    for i in range(len(message_entries) - 1, -1, -1):
-        tokens += estimate_message_tokens(message_entries[i].message)
-        if tokens > keep_tokens:
-            split = i + 1
-            break
-    # Snap forward to the next user message so tool call/result groups are never
-    # split. Mid-turn there is no later user message: snap back to the last one
-    # so the current turn is kept and older turns are dropped instead.
-    start = split
-    while start < len(message_entries) and getattr(message_entries[start].message, "role", None) != "user":
-        start += 1
-    if start >= len(message_entries):
-        start = next(
-            (
-                i
-                for i in range(len(message_entries) - 1, -1, -1)
-                if getattr(message_entries[i].message, "role", None) == "user"
-            ),
-            0,
-        )
-    split = start
-    dropped = message_entries[:split]
-    kept = message_entries[split:]
-    if not dropped or not kept:
-        return None
-    dropped_messages = [entry.message for entry in dropped]
-    prior_summary = next(
-        (entry.data.get("summary") for entry in reversed(session.path_entries()) if entry.type == "compaction"), None
-    )
-    transcript = _render_transcript(dropped_messages)
-    prompt_parts = [f"[Conversation to summarize]\n{transcript}", "[End of conversation]"]
-    if prior_summary:
-        prompt_parts.insert(0, f"[Summary of even earlier context]\n{prior_summary}")
-    if custom_instructions:
-        prompt_parts.append(f"Additional instructions: {custom_instructions}")
-    prompt_parts.append("Now write the summary.")
-    context = LlmContext(
-        messages=[SystemMessage(content=SUMMARIZATION_SYSTEM), UserMessage(content="\n\n".join(prompt_parts))], tools=[]
-    )
-    summary = _collect_text(stream_fn, model, context, api_key)
-    if not summary:
-        return None
-    return CompactionResult(
-        summary=summary,
-        first_kept_entry_id=kept[0].id,
-        tokens_before=estimate_tokens(dropped_messages),
-        messages_summarized=len(dropped_messages),
-    )
 
 
 HOOK_EVENTS = ("tool_call", "session_start", "agent_end")
