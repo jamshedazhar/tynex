@@ -4,13 +4,14 @@ from collections.abc import Callable
 
 from tynex.agent.types import AgentTool
 from tynex.coding.tools.edit import EditTool
+from tynex.coding.tools.plan import PLAN_TOOL_NAME, SubmitPlanTool
 from tynex.coding.tools.read import ReadTool
 from tynex.coding.tools.readonly import FindTool, GrepTool, LsTool
 from tynex.coding.tools.shell import ShellTool, shell_name
 from tynex.coding.tools.websearch import WebSearchTool
 from tynex.coding.tools.write import WriteTool
 
-DEFAULT_TOOL_NAMES = ["read", shell_name, "edit", "write", "websearch"]
+DEFAULT_TOOL_NAMES = ["read", shell_name, "edit", "write", "websearch", PLAN_TOOL_NAME]
 READ_ONLY_TOOL_NAMES = ["grep", "find", "ls"]
 ALL_TOOL_NAMES = list(dict.fromkeys(DEFAULT_TOOL_NAMES + READ_ONLY_TOOL_NAMES))
 
@@ -23,6 +24,7 @@ _FACTORIES: dict[str, Callable[[str], AgentTool]] = {
     "find": FindTool,
     "ls": LsTool,
     "websearch": lambda _cwd: WebSearchTool(),
+    PLAN_TOOL_NAME: lambda _cwd: SubmitPlanTool(),
 }
 
 
