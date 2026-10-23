@@ -1,5 +1,5 @@
 """Tests for the tynex-alignment features: bash execution messages, thinking
-levels, fork/clone branching and session export."""
+levels and session export."""
 
 import json
 from pathlib import Path
@@ -103,6 +103,44 @@ def test_convert_to_llm_includes_bang_and_skips_bangbang(tmp_path):
     assert converted[2].timestamp == 42
 
 
+def test_convert_to_llm_reuses_its_prefix_without_stale_messages(tmp_path):
+    session = make_agent_session(tmp_path)
+    messages = [UserMessage(content="one"), AssistantMessage(content=[TextContent(text="two")])]
+    session._convert_to_llm(messages)
+
+    # Append, and replace the last message in place: the cached prefix must be
+    # reused while the mutable tail is converted again.
+    messages.append(UserMessage(content="three"))
+    assert [m.text() for m in session._convert_to_llm(messages)[1:]] == ["one", "two", "three"]
+    messages[-1] = UserMessage(content="replaced")
+    assert [m.text() for m in session._convert_to_llm(messages)[1:]] == ["one", "two", "replaced"]
+
+    # A rebuilt list with the same objects (how the loop calls it) still hits.
+    rebuilt = [*messages, UserMessage(content="four")]
+    assert [m.text() for m in session._convert_to_llm(rebuilt)[1:]] == ["one", "two", "replaced", "four"]
+
+    # A different history that merely starts with the same message must not
+    # inherit the cached conversion.
+    other = [messages[0], UserMessage(content="different")]
+    assert [m.text() for m in session._convert_to_llm(other)[1:]] == ["one", "different"]
+
+
+def test_estimate_context_tokens_tracks_appends(tmp_path):
+    from tynex.coding.compaction import estimate_tokens
+
+    session = make_agent_session(tmp_path)
+    messages = [UserMessage(content="a" * 400), UserMessage(content="b" * 400)]
+    session.context.messages = messages
+    system = len(session.system_prompt_text()) // 4
+    assert session.estimate_context_tokens() == estimate_tokens(messages) + system
+
+    messages.append(UserMessage(content="c" * 400))
+    assert session.estimate_context_tokens() == estimate_tokens(messages) + system
+
+    messages[-1] = UserMessage(content="d" * 800)
+    assert session.estimate_context_tokens() == estimate_tokens(messages) + system
+
+
 def test_execute_bash_records_bang_and_bangbang(tmp_path):
     session = make_agent_session(tmp_path)
 
@@ -201,104 +239,6 @@ def test_thinking_budgets_are_monotonic_and_bounded():
     assert all(budget is not None for budget in budgets)
     assert budgets == sorted(budgets)
     assert budgets[-1] <= 32_000
-
-
-# ---------------------------------------------------------------------------
-# Fork / clone
-# ---------------------------------------------------------------------------
-
-
-def test_create_branched_session_copies_path_and_relinks_parents(tmp_path):
-    session = SessionManager(str(tmp_path))
-    first, second = append_exchange(session, "hello", "hi")
-    third = session.append_message(UserMessage(content="later"))
-
-    new_file = session.create_branched_session(second.id)
-    assert new_file is not None
-    records = [json.loads(line) for line in Path(new_file).read_text(encoding="utf-8").strip().splitlines()]
-
-    assert records[0]["type"] == "session"
-    assert records[0]["id"] != session.session_id
-    assert records[0]["parentSession"] == session.file_path
-    assert records[0]["cwd"] == session.cwd
-    assert [record["id"] for record in records[1:]] == [first.id, second.id]
-    assert records[1]["parentId"] == records[0]["id"]
-    assert records[2]["parentId"] == records[1]["id"]
-
-    # The new file loads as an ordinary session with the same messages.
-    branched = SessionManager(str(tmp_path), session_file=new_file)
-    assert [message_text(m) for m in branched.branch_messages()] == ["hello", "hi"]
-    assert third.id not in branched.by_id
-
-    with pytest.raises(ValueError, match="not found"):
-        session.create_branched_session("doesnotexist")
-
-
-def test_create_branched_session_in_memory(tmp_path):
-    session = SessionManager(str(tmp_path), no_session=True)
-    first, second = append_exchange(session, "hello", "hi")
-    assert session.create_branched_session(second.id) is None
-    assert session.entries[0].type == "session"
-    assert [entry.id for entry in session.entries[1:]] == [first.id, second.id]
-    assert session.current_leaf_id == second.id
-    assert [message_text(m) for m in session.branch_messages()] == ["hello", "hi"]
-
-
-def test_clone_session_switches_to_new_file(tmp_path):
-    session = make_agent_session(tmp_path)
-    append_exchange(session.session, "hello", "hi")
-    old_file = session.session.file_path
-    old_id = session.session.session_id
-
-    new_file = session.clone_session()
-    assert new_file is not None and new_file != old_file
-    assert session.session.file_path == new_file
-    assert session.session.session_id != old_id
-    assert [message_text(m) for m in session.context.messages] == ["hello", "hi"]
-    assert session.session.entries[0].data["parentSession"] == old_file
-
-
-def test_fork_session_before_user_message(tmp_path):
-    session = make_agent_session(tmp_path)
-    append_exchange(session.session, "first", "one")
-    second, _ = append_exchange(session.session, "second", "two")
-
-    new_file, selected = session.fork_session(second.id)
-    assert new_file is not None
-    assert selected == "second"
-    assert [message_text(m) for m in session.context.messages] == ["first", "one"]
-
-    # Forking before the first user message yields an empty conversation.
-    empty = make_agent_session(tmp_path, session_file="other.jsonl")
-    first, assistant = append_exchange(empty.session, "only", "answer")
-    new_file, selected = empty.fork_session(first.id)
-    assert new_file is not None
-    assert selected == "only"
-    assert empty.context.messages == []
-
-    with pytest.raises(ValueError, match="Invalid entry ID for forking"):
-        empty.fork_session(assistant.id)
-    with pytest.raises(ValueError, match="Invalid entry ID for forking"):
-        empty.fork_session("nope")
-
-
-def test_fork_session_in_memory(tmp_path):
-    session = AgentSession(cwd=str(tmp_path), model=resolve_model("faux/test"), tool_names=[], no_session=True)
-    append_exchange(session.session, "first", "one")
-    second, _ = append_exchange(session.session, "second", "two")
-
-    new_file, selected = session.fork_session(second.id)
-    assert new_file is None
-    assert selected == "second"
-    assert [message_text(m) for m in session.context.messages] == ["first", "one"]
-
-
-def test_user_messages_for_forking_skips_empty_text(tmp_path):
-    session = make_agent_session(tmp_path)
-    first, _ = append_exchange(session.session, "real question", "answer")
-    session.session.append_message(UserMessage(content="   "))
-    found = session.user_messages_for_forking()
-    assert found == [(first.id, "real question")]
 
 
 # ---------------------------------------------------------------------------

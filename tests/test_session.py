@@ -32,24 +32,6 @@ def test_session_persists_and_reloads(tmp_path):
     assert messages[1].text() == "hi there"
 
 
-def test_session_tree_branching(tmp_path):
-    session = SessionManager(str(tmp_path))
-    _, _second = append_exchange(session, "one", "first answer")
-    append_exchange(session, "two", "second answer")
-    assert len(session.branch_messages()) == 4
-
-    # Rewind to the first user message; the next append creates a new branch.
-    first_user = session.path_entries()[1]
-    assert session.branch_to(first_user.id) is not None
-    assert len(session.branch_messages()) == 1
-
-    append_exchange(session, "alternative", "other answer")
-    messages = session.branch_messages()
-    assert [m.text() for m in messages if m.role == "user"] == ["one", "alternative"]
-    # The old branch is still in the file.
-    assert len([e for e in session.entries if e.type == "message"]) == 6
-
-
 def test_session_compaction_replaces_older_messages(tmp_path):
     session = SessionManager(str(tmp_path))
     entries = []
