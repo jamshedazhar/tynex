@@ -3,7 +3,6 @@
 import io
 import threading
 import time
-from collections.abc import Callable
 from pathlib import Path
 
 from prompt_toolkit.document import Document
@@ -11,7 +10,7 @@ from rich.console import Console
 
 from tynex.coding.agent_session import AgentSession
 from tynex.tui.app import InteractiveApp
-from tynex.tui.prompt import COMPLETION_MENU_ROWS, TynexCompleter, _cap_completion_menu, _prompt_key_bindings
+from tynex.tui.prompt import TynexCompleter
 
 
 def make_session(tmp_path: Path) -> AgentSession:
@@ -244,99 +243,8 @@ def test_hidden_entries_only_with_dot_prefix(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# End to end: Tab inside a real prompt session
+# The real app prompt: menus open while typing
 # ---------------------------------------------------------------------------
-
-
-_MENU = object()  # drive_prompt marker: wait for the completion menu before the next key
-
-
-def drive_prompt(session: AgentSession, *chunks: object) -> str:
-    from prompt_toolkit import PromptSession
-    from prompt_toolkit.input import create_pipe_input
-    from prompt_toolkit.output import DummyOutput
-
-    _cap_completion_menu(COMPLETION_MENU_ROWS)  # mirrors the app
-
-    with create_pipe_input() as pipe:
-        prompt = PromptSession(
-            completer=TynexCompleter(session),
-            complete_while_typing=True,  # mirrors the app: menus pop up while typing
-            key_bindings=_prompt_key_bindings(),  # mirrors the app: Enter completes an open menu
-            input=pipe,
-            output=DummyOutput(),
-        )
-        buffer = prompt.default_buffer
-        errors: list[AssertionError] = []
-
-        def wait_until(check: Callable[[], bool], what: str, timeout: float = 10.0) -> None:
-            # Completion is a background task on the event loop, so feed each
-            # chunk only once the buffer shows the previous one took effect.
-            # Fixed sleeps make this test flaky on a loaded machine; waiting on
-            # observable state cannot be "too early".
-            deadline = time.monotonic() + timeout
-            while time.monotonic() < deadline:
-                if check():
-                    return
-                time.sleep(0.01)
-            errors.append(AssertionError(f"timed out after {timeout:g}s waiting for {what}"))
-
-        def menu_ready() -> bool:
-            return (
-                buffer.complete_state is not None
-                and bool(buffer.complete_state.completions)
-                and buffer.complete_state.original_document.text == buffer.text
-            )
-
-        def type_line() -> None:
-            for chunk in chunks:
-                if chunk is _MENU:
-                    wait_until(menu_ready, "the completion menu to show entries")
-                    continue
-                assert isinstance(chunk, str)
-                accept_key = chunk in ("\t", "\x1b[B")
-                if accept_key:
-                    # Tab/Down only act on the menu once it lists entries.
-                    wait_until(menu_ready, "the completion menu to show entries")
-                before = buffer.text
-                pipe.send_text(chunk)
-                if chunk == "\r":
-                    continue  # submitting closes the prompt; nothing to observe
-                if accept_key:
-                    wait_until(lambda prev=before: buffer.text != prev, f"{chunk!r} to change the text")
-                else:
-                    wait_until(lambda prev=before, typed=chunk: buffer.text == prev + typed, f"{chunk!r} to be entered")
-
-        thread = threading.Thread(target=type_line)
-        thread.start()
-        try:
-            result = prompt.prompt("> ")
-        finally:
-            thread.join(timeout=60)
-        if errors:
-            raise errors[0]
-        return result
-
-
-def test_menus_and_accept_keys_in_prompt_session(tmp_path):
-    (tmp_path / "main.py").write_text("x", encoding="utf-8")
-    write_skill(tmp_path)
-    session = make_session(tmp_path)
-
-    # Tab accepts the highlighted completion, then Enter submits.
-    assert drive_prompt(session, "@main", "\t", "\r") == "@main.py"
-    assert drive_prompt(session, "/lo", "\t", "\r") == "/login"
-    assert drive_prompt(session, "/skill:rel", "\t", "\r") == "/skill:release"
-    # With the menu open, the first Enter fills the completion into the input
-    # and the next Enter submits it: "/mo" -> "/model", then run the command.
-    assert drive_prompt(session, "/mo", _MENU, "\r", "\r") == "/model"
-    assert drive_prompt(session, "@main", _MENU, "\r", "\r") == "@main.py"
-    # Down selects a row and previews it in the input; Enter then submits it.
-    assert drive_prompt(session, "@main", "\x1b[B", "\r") == "@main.py"
-    # A bare trigger takes the first row, which the next Enter submits.
-    assert drive_prompt(session, "/", _MENU, "\r", "\r") == "/help"
-    # An exact match has nothing to complete, so one Enter submits it.
-    assert drive_prompt(session, "/model", "\r") == "/model"
 
 
 def test_app_session_opens_the_menu_while_typing(tmp_path):

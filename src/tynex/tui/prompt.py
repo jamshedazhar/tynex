@@ -1,16 +1,12 @@
 """prompt_toolkit setup for the terminal UI."""
 
-import importlib
 import os
 from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING, Any, NamedTuple
 
-import prompt_toolkit.layout.menus as pt_menus
 from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.document import Document
 from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.layout.controls import UIContent
-from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.styles import Style
 
 from tynex.coding.tools.path_utils import resolve_path
@@ -21,63 +17,6 @@ if TYPE_CHECKING:
 PROMPT_STYLE = Style.from_dict(
     {"prompt": "ansicyan bold", "bottom-toolbar": "fg:ansibrightblack", "placeholder": "fg:ansibrightblack"}
 )
-
-COMPLETION_MENU_ROWS = 5  # menu shows this many entries; ↑/↓ scrolls through the rest
-COMPLETION_LABEL_WIDTH = 28  # minimum label column; long entries widen it
-COMPLETION_MENU_FILL_WIDTH = 10_000  # larger than any terminal: the float clamps it
-
-
-def _cap_completion_menu(rows: int) -> None:
-    # ``prompt_toolkit.shortcuts`` re-exports the ``prompt()`` function under the
-    # name ``prompt``, which shadows the ``prompt`` submodule: a normal
-    # ``import prompt_toolkit.shortcuts.prompt as x`` binds that function. We
-    # need the module object itself to replace its ``CompletionsMenu`` global
-    # (the prompt layout looks the name up at call time).
-    prompt_module = importlib.import_module("prompt_toolkit.shortcuts.prompt")
-    current = prompt_module.CompletionsMenu
-    if getattr(current, "_pi_menu_rows", None) == rows:
-        return
-
-    class AlignedControl(pt_menus.CompletionsMenuControl):
-        """Full-width menu rows with a fixed label column."""
-
-        def create_content(self, width: int, _height: int) -> UIContent:
-            complete_state = pt_menus.get_app().current_buffer.complete_state
-            if complete_state is None:
-                return UIContent()
-            completions = complete_state.completions
-            index = complete_state.complete_index
-            show_meta = any(completion.display_meta_text for completion in completions)
-            if show_meta:
-                display_width = max(pt_menus.get_cwidth(c.display_text) for c in completions) + 2
-                label_width = min(max(8, width - 4), max(COMPLETION_LABEL_WIDTH, display_width))
-                meta_width = max(0, width - label_width)
-            else:
-                label_width, meta_width = max(1, width), 0
-
-            def get_line(i: int) -> list[tuple[str, str]]:
-                completion = completions[i]
-                is_current = i == index
-                fragments = pt_menus._get_menu_item_fragments(completion, is_current, label_width, space_after=True)
-                if show_meta and meta_width > 0:
-                    fragments += self._get_menu_item_meta_fragments(completion, is_current, meta_width)
-                return fragments
-
-            return UIContent(
-                get_line=get_line, cursor_position=pt_menus.Point(x=0, y=index or 0), line_count=len(completions)
-            )
-
-    def capped(*args: Any, **kwargs: Any) -> Any:
-        kwargs["max_height"] = rows
-        kwargs["display_arrows"] = True
-        menu = current(*args, **kwargs)
-        window = menu.content
-        window.content = AlignedControl()
-        window.width = Dimension(min=8, preferred=COMPLETION_MENU_FILL_WIDTH)
-        return menu
-
-    capped._pi_menu_rows = rows  # type: ignore[attr-defined]
-    prompt_module.CompletionsMenu = capped
 
 
 def _prompt_key_bindings(
@@ -223,16 +162,15 @@ COMMANDS: dict[str, Command] = {
     "help": Command("", "show commands and shortcuts"),
     "model": Command("[pattern]", "switch model (no argument picks one from the current provider)"),
     "thinking": Command("[level]", "set the thinking level (no argument picks one)"),
-    "tree": Command("[entry-id]", "show the session tree; branch to an entry"),
     "compact": Command("[notes]", "summarize older messages now"),
     "new": Command("", "start a fresh session"),
     "resume": Command("[id]", "resume a past session"),
-    "fork": Command("[entry-id]", "fork a new session before a user message"),
-    "clone": Command("", "duplicate the session at its current position"),
     "export": Command("[path]", "export the transcript (.jsonl branch, else HTML)"),
     "name": Command("<label>", "label the current session"),
     "session": Command("", "session statistics"),
-    "permissions": Command("[mode <name>]", "show or switch the tool approval policy"),
+    "permissions": Command("[mode] <name>", "show or switch the tool approval policy"),
+    "plan": Command("", "switch to plan mode: investigate read-only, then submit a plan"),
+    "approve": Command("", "approve the pending plan and switch to accept-edits"),
     "budget": Command("", "show token/cost budget and usage"),
     "undo": Command("[count]", "revert the files changed by the last tool calls"),
     "mcp": Command("", "list connected MCP servers and their tools"),
