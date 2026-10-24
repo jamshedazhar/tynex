@@ -19,6 +19,7 @@
 
 For installation, commands, permissions, sessions, MCP, and configuration, see
 the [Tynex User Guide](https://github.com/jamshedazhar/tynex/blob/main/docs/user-guide.md).
+Release history is in the [CHANGELOG](https://github.com/jamshedazhar/tynex/blob/main/CHANGELOG.md).
 
 ## Features
 
@@ -27,16 +28,16 @@ the [Tynex User Guide](https://github.com/jamshedazhar/tynex/blob/main/docs/user
 - **Providers** — Anthropic, OpenAI-compatible (OpenAI, xAI, Groq, DeepSeek,
   Mistral, OpenRouter, Ollama, …), Google Gemini, GitHub Copilot, and an offline
   `faux` provider for tests and demos.
-- **Tools** — `read`, `bash`/`powershell`, `edit`, `write`, `grep`, `find`, `ls`
-  and `websearch`. Searches use the in-process `ripgrep-rs` engine and respect
+- **Tools** — `read`, `bash`/`powershell`, `edit`, `write`, `submit_plan` and
+  `websearch`; `grep`, `find` and `ls` are available to the SDK and to explicit
+  tool lists. Searches use the in-process `ripgrep-rs` engine and respect
   `.gitignore`.
 - **Permissions** — `plan`, `ask`, `accept-edits` (default) and `bypass`,
   refined by glob rules in `permissions.toml`. Every decision is recorded in the
   session and explained to the model when a call is blocked.
 - **Budgets** — opt-in caps on total tokens or cost:
   `--budget cost=2.50` or `--budget tokens=250000`.
-- **Sessions** — JSONL session tree with resume, fork, clone, export, labels and
-  automatic compaction.
+- **Sessions** — JSONL session tree with resume, export, labels and automatic compaction.
 - **Checkpoints** — `write`/`edit` snapshot the files they change; `/undo`
   restores them.
 - **MCP** — stdio and streamable-HTTP servers from `settings.json`, plus the
@@ -46,7 +47,10 @@ the [Tynex User Guide](https://github.com/jamshedazhar/tynex/blob/main/docs/user
 - **Code review skill** — conditionally runs ruff, sqlfluff, hadolint, tofu and
   tflint, then a verified correctness/security review using repository guidance
   (`AGENTS.md`, `REVIEW.md`) when present, risk tiers and a report.
-- **Four run modes** — interactive TUI, print, JSON and RPC over stdio.
+- **Plan mode** — the agent investigates read-only, submits a plan with
+  `submit_plan`, and the turn ends for an explicit approve/reject decision that
+  is recorded in the session.
+- **Three run modes** — interactive TUI, print, and JSON over stdio.
 - **SDK** — typed `@tool` functions and a sync/async `Agent` with events,
   approvals, MCP and budgets.
 - **Cross-platform** — Windows, macOS and Linux. File edits preserve line
@@ -85,21 +89,29 @@ tynex -c                             # continue the latest session
 tynex -r <id-prefix>                 # resume a specific session
 tynex models [provider]              # provider catalogs
 tynex sessions                       # sessions for this directory
+tynex --plan "add retries to the client"   # plan first, approve, then execute
 tynex --help                         # every flag and subcommand
+
+# Run flags may follow the prompt too; `--` ends them.
+tynex "fix the failing tests" --permission-mode plan
 ```
 
 TUI essentials:
 
 - `/` opens the command menu; `@` completes files. `Tab` accepts a completion;
   `Enter` fills it so you can keep typing, then submits on the next `Enter`.
-- `/model`, `/thinking`, `/permissions`, `/resume`, `/fork`, `/compact` and
+- `/model`, `/thinking`, `/permissions`, `/resume`, `/compact`, `/approve` and
   `/undo` cover the common workflows.
 - `!command` runs a shell command and adds its output to the conversation;
   `!!command` runs it without adding the output to the model context.
 - `Esc` or `Ctrl+C` interrupts a turn. Text submitted during a turn is queued as
   steering; `/commands` and `!shell` lines return to the editor.
-- `/thinking` changes are stored in the session and in `settings.json`; they are
-  restored on resume.
+- A tool call is one line until you open it: click the block (or `Ctrl+O`) to
+  see its full input and output, and click or `Ctrl+O` again to close it. The
+  transcript scrolls on its own — mouse wheel or `PgUp`/`PgDn`.
+- `/thinking` levels come from the model's catalog (`deepseek` reports `low`,
+  `high`, `max`), and a level the model does not take is clamped to the nearest.
+  The choice is stored in the session and in `settings.json`, restored on resume.
 
 ## Permissions
 
@@ -113,9 +125,12 @@ mode decides what runs without asking:
 | `accept-edits` *(default)* | allow | allow | ask |
 | `bypass` | allow | allow | allow |
 
-In the TUI an `ask` opens an approval panel (`y` allow once, `a` allow for the
-session, `n` deny). Headless modes cannot prompt, so `ask` becomes a denial with
-an actionable message.
+In the TUI an `ask` prints the request above the input line and asks there, in
+the same editor: `y` allows once, `a` allows for the session, `n` (or `Esc`)
+denies. Headless modes cannot prompt, so `ask` becomes a denial with an
+actionable message. The active mode is shown in the startup banner and the
+footer, and `/permissions <name>` (or `/permissions mode <name>`) switches it
+mid-session.
 
 Rules refine the mode. They live in two files, merged global first and project
 last; inside a file the **last matching rule wins**:
@@ -139,13 +154,37 @@ action = "allow"
 rules may tighten it but not widen it. The effective mode comes from
 `--permission-mode`, then `permissionMode` in `settings.json`, then `mode` in a
 permissions file, then `accept-edits`. `/permissions` shows the mode, rules and
-session grants; `/permissions mode ask` switches mid-session.
+session grants; `/permissions ask` (or `/permissions mode ask`) switches
+mid-session.
 
 The workspace guard confines `read`, `write`, `edit`, `grep`, `find` and `ls` to
 the directory Tynex was started in: absolute paths, `..` segments and escaping
 symlinks are rejected, and `@` completion only lists workspace files. Shell
 commands are **not** OS-sandboxed — treat the guard as protection against
 mistakes and prompt injection, not as a security boundary for untrusted code.
+
+## Plan mode
+
+`tynex --plan "..."` starts in `plan` mode (`/plan` switches an interactive
+session). The agent explores with read-only
+tools, then calls `submit_plan`; that tool ends the turn so the plan is reviewed
+instead of half-implemented. In the TUI the plan is printed and you choose
+`y` (approve and execute) or `n` (keep planning); `/approve` accepts a plan you
+deferred. Approving switches to `accept-edits` and records `plan_approved` in
+the session; rejecting records `plan_rejected` and leaves plan mode active.
+
+Headless runs print the plan to stdout and keep it in the session (when the
+same turn also emitted assistant text, only the plan is printed):
+
+```bash
+tynex -p --plan "add retries to the HTTP client"
+tynex -c --permission-mode accept-edits "execute the approved plan"
+```
+
+Plan mode is enforced by the permission gate, not by the prompt: writes, edits,
+shell commands and MCP calls are denied while it is active, and `submit_plan`
+is refused outside it. The plan and its decision are session entries, so
+resuming an unreviewed plan restores it instead of losing it.
 
 ## Budgets
 
@@ -359,12 +398,11 @@ uv run python examples/sdk_agent.py --budget cost=0.50 "tour this repository"
 | `/thinking [level]` | set the thinking level |
 | `/new` | start a new session |
 | `/resume`, `/sessions [id]` | browse and switch sessions |
-| `/fork [id]` | fork before an earlier user message |
-| `/clone` | duplicate the current branch |
 | `/export [path]` | export JSONL branch or static HTML |
-| `/tree [id]` | inspect the session tree |
 | `/compact [instructions]` | compact the conversation |
-| `/permissions [mode <mode>]` | show or switch the approval policy |
+| `/permissions [mode] <mode>` | show or switch the approval policy |
+| `/plan` | switch to plan mode (read-only investigation, then `submit_plan`) |
+| `/approve` | accept the pending plan and switch to `accept-edits` |
 | `/budget` | show token/cost budget and usage |
 | `/undo [count]` | restore files changed by the last write/edit calls |
 | `/mcp` | list configured MCP servers and tools |
@@ -384,10 +422,7 @@ results, shell executions, model and thinking changes, labels, and compaction
 markers. Compaction summarizes older messages and records a `firstKeptEntryId`,
 so resume rebuilds the context without resending summarized history.
 
-`/clone` copies the active branch into a new session file; `/fork` stops before
-a chosen user message and returns that message to the editor. `/export
-path.jsonl` writes the active branch; any other path writes a self-contained
-static HTML transcript.
+`/export path.jsonl` writes the active branch; any other path writes a self-contained static HTML transcript.
 
 ## Development
 
