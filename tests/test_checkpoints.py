@@ -1,5 +1,7 @@
 """File checkpoints: snapshotting before edits and restoring with /undo (offline)."""
 
+import json
+
 from tests.conftest import faux_scenario, text_scenario
 from tynex.ai.providers import faux
 from tynex.coding.agent_session import AgentSession
@@ -46,6 +48,24 @@ def test_capture_ignores_nothing_and_outside_paths(tmp_path):
     assert store.capture("edit", [outside]) is None  # outside workspace: nothing captured
 
 
+def test_undo_refuses_a_tampered_manifest_path(tmp_path):
+    """The manifest is plain JSON on disk: a crafted path must not touch anything outside."""
+    (tmp_path / "file.txt").write_text("v1", encoding="utf-8")
+    store = CheckpointStore(str(tmp_path), "test-session")
+    store.capture("edit", ["file.txt"])
+    outside = tmp_path.parent / "escape.txt"
+    outside.write_text("untouched", encoding="utf-8")
+    manifest = store.root / "0001" / "manifest.json"
+    data = json.loads(manifest.read_text(encoding="utf-8"))
+    data["files"] = [{"path": "../escape.txt", "action": "created", "size": 0}]
+    manifest.write_text(json.dumps(data), encoding="utf-8")
+    reloaded = CheckpointStore(str(tmp_path), "test-session")  # read the edited manifest
+
+    assert reloaded.undo(1) == []
+    assert outside.read_text(encoding="utf-8") == "untouched"
+    assert any("unsafe path" in warning for warning in reloaded.warnings)
+
+
 def test_undo_restores_and_removes(tmp_path):
     (tmp_path / "keep.txt").write_text("v1", encoding="utf-8")
     store = CheckpointStore(str(tmp_path), "test-session")
@@ -60,6 +80,30 @@ def test_undo_restores_and_removes(tmp_path):
     assert not (store.root / "0001" / "files").exists()  # snapshots cleaned up
     # nothing new to undo
     assert store.undo(1) == []
+
+
+def test_a_failed_undo_keeps_the_snapshot_and_stays_retryable(tmp_path, monkeypatch):
+    from tynex.coding import checkpoints as checkpoint_module
+
+    (tmp_path / "file.txt").write_text("v1", encoding="utf-8")
+    store = CheckpointStore(str(tmp_path), "test-session")
+    store.capture("edit", ["file.txt"])
+    (tmp_path / "file.txt").write_text("v2", encoding="utf-8")
+
+    def fail(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(checkpoint_module.shutil, "copy2", fail)
+    assert store.undo(1) == []
+    assert any("undo failed" in warning for warning in store.warnings)
+    assert store.groups()[0].undone is False  # still pending
+    assert (store.root / "0001" / "files" / "file.txt").exists()  # backup kept
+    assert (tmp_path / "file.txt").read_text(encoding="utf-8") == "v2"
+
+    monkeypatch.undo()
+    restored = store.undo(1)
+    assert [group.id for group in restored] == [1]
+    assert (tmp_path / "file.txt").read_text(encoding="utf-8") == "v1"
 
 
 def test_undo_multiple_groups_restores_in_order(tmp_path):
