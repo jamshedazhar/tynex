@@ -3,7 +3,6 @@
 import contextlib
 import json
 import os
-import queue
 import shutil
 import signal
 import sys
@@ -69,6 +68,8 @@ _EVENT_KEYS = (
     "tool",
     "subject",
     "args",
+    "plan",
+    "planId",
 )
 
 
@@ -114,7 +115,10 @@ def print_models(settings: dict[str, Any], provider: str | None = None) -> None:
             click.echo(f"  ({note or f'no models — run `tynex login {name}`'})")
             continue
         for model in models:
-            flags = " (reasoning)" if model.reasoning else ""
+            if model.thinking_levels:
+                flags = f" (thinking: {', '.join(model.thinking_levels)})"
+            else:
+                flags = " (reasoning)" if model.reasoning else ""
             click.echo(f"  {format_model(model)}  — {model.name}, {model.context_window:,} ctx{flags}")
 
 
@@ -394,19 +398,76 @@ class TynexGroup(click.Group):
     """Give the default run and the subcommands one Click-generated help screen."""
 
     def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
-        rest = click.Command.parse_args(self, ctx, args)
+        rest = click.Command.parse_args(self, ctx, self._hoist_run_options(list(args)))
         if rest and rest[0] in self.commands:
             ctx._protected_args, ctx.args = rest[:1], rest[1:]
         else:
             ctx.args, ctx._protected_args = rest, []
         return ctx.args
 
+    def _option_tokens(self) -> dict[str, click.Option]:
+        """Every spelling (``-m``, ``--model``) of the run flags, mapped to its option."""
+        return {
+            spelling: param
+            for param in self.params
+            if isinstance(param, click.Option)
+            for spelling in (*param.opts, *param.secondary_opts)
+        }
+
+    def _hoist_run_options(self, args: list[str]) -> list[str]:
+        """Move run flags that follow the prompt in front of it.
+
+        A Click group stops parsing options at the first non-option argument, so
+        ``tynex "fix the tests" --permission-mode plan`` silently made the flag
+        part of the prompt. Only known run flags are moved; any other flag-like
+        word (``tynex explain --tests``) stays in the prompt, and ``--`` ends the
+        flags so a prompt can carry them verbatim.
+        """
+        if not args or args[0] in self.commands:
+            return args  # subcommand dispatch keeps Click's own parsing
+        options = self._option_tokens()
+        flags: list[str] = []
+        prompt: list[str] = []
+        # True once a flag is left without a value in front of prompt words,
+        # which Click would otherwise feed to it (``--resume`` takes the prompt).
+        needs_terminator = False
+        index = 0
+        while index < len(args):
+            token = args[index]
+            index += 1
+            if token == "--":
+                # Keep the terminator: Click then reads the rest as prompt words.
+                flags.append(token)
+                prompt.extend(args[index:])
+                break
+            name, has_value, _ = token.partition("=")
+            option = options.get(name if has_value else token)
+            if option is None:
+                prompt.append(token)
+                continue
+            flags.append(token)
+            if has_value or option.is_flag:
+                continue
+            value = args[index] if index < len(args) else None
+            # ``-c``/``-r``/``--resume`` may stand alone; other options need a value.
+            if value is not None and (option.flag_value is None or not value.startswith("-")):
+                flags.append(value)
+                index += 1
+            elif option.flag_value is not None and (prompt or index < len(args)):
+                # Only an optional-value flag can swallow a prompt word; a
+                # required one gets Click's own "requires an argument" error.
+                needs_terminator = True
+        # ``tynex "fix it" -c`` must resume, not resume a session called
+        # "fix it": end the options before the prompt words.
+        if needs_terminator and prompt and "--" not in flags:
+            flags.append("--")
+        return flags + prompt
+
 
 @click.group(cls=TynexGroup, context_settings=CONTEXT_SETTINGS, invoke_without_command=True)
 @click.version_option(__version__, "-v", "--version", prog_name="tynex", message="%(prog)s %(version)s")
 @click.option("-p", "--print", "print_mode", is_flag=True, help="Run once and print the response.")
 @click.option("--json", "json_mode", is_flag=True, help="Run once and emit JSON events.")
-@click.option("--rpc", "rpc_mode", is_flag=True, help="Serve the JSON-RPC protocol on stdin/stdout.")
 @click.option(
     "-c",
     "-r",
@@ -426,6 +487,12 @@ class TynexGroup(click.Group):
     type=click.Choice(list(PERMISSION_MODES)),
     help="Approval policy: plan, ask, accept-edits (default), bypass. Per-tool rules: permissions.toml.",
 )
+@click.option(
+    "--plan",
+    "plan_mode",
+    is_flag=True,
+    help="Start in plan mode: investigate, submit a plan for approval, then execute it.",
+)
 @click.option("--budget", metavar="SPEC", help="Hard cap: cost=USD (e.g. cost=2.50) or tokens=N (e.g. tokens=250000).")
 @click.option("--no-mcp", is_flag=True, help="Do not start MCP servers configured in settings.json.")
 @click.option("--no-session", is_flag=True, help="Do not persist the session to disk.")
@@ -435,11 +502,11 @@ def cli(
     ctx: click.Context,
     print_mode: bool,
     json_mode: bool,
-    rpc_mode: bool,
     resume: str | None,
     model: str | None,
     thinking: str | None,
     permission_mode: str | None,
+    plan_mode: bool,
     budget: str | None,
     no_mcp: bool,
     no_session: bool,
@@ -452,15 +519,19 @@ def cli(
     """
     if ctx.invoked_subcommand is not None:
         return None
-    modes = [name for name, enabled in (("print", print_mode), ("json", json_mode), ("rpc", rpc_mode)) if enabled]
-    if len(modes) > 1:
-        raise CliError("choose one of --print, --json or --rpc")
-    mode = modes[0] if modes else "interactive"
+    if print_mode and json_mode:
+        raise CliError("choose one of --print or --json")
+    mode = "print" if print_mode else "json" if json_mode else "interactive"
     text = " ".join(ctx.args).strip()
     if mode in ("print", "json") and not text and not sys.stdin.isatty():
         text = sys.stdin.read().strip()
     if mode in ("print", "json") and not text:
         raise CliError(f"{mode} mode requires a prompt (pass it as an argument or on stdin)")
+
+    if plan_mode and permission_mode not in (None, "plan"):
+        raise CliError("--plan selects plan mode; drop --permission-mode")
+    if plan_mode:
+        permission_mode = "plan"
 
     cwd = os.getcwd()
     settings = _settings()
@@ -492,6 +563,21 @@ def cli(
         budget=budget_limits,
         mcp=not no_mcp,
     )
+    if thinking and session.thinking != thinking:
+        # A flag the session cannot honour must say so; silently running at
+        # "off" looks like the option was ignored.
+        subject = format_model(session.model) if session.model is not None else "no model is selected"
+        if session.model is not None and session.model.reasoning:
+            offered = ", ".join(session.available_thinking_levels())
+            print(
+                f"[tynex] --thinking {thinking} is not offered by {subject}; using '{session.thinking}' ({offered}).",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"[tynex] --thinking {thinking} needs a reasoning model — {subject}; using '{session.thinking}'.",
+                file=sys.stderr,
+            )
     if mode != "interactive" and session.model is None:
         raise CliError(
             "no model available — sign in with `tynex login` or set a provider API key, then retry "
@@ -503,8 +589,6 @@ def cli(
         return run_print(session, text)
     if mode == "json":
         return run_json(session, text)
-    if mode == "rpc":
-        return run_rpc(session)
     try:
         from tynex.tui.app import run_interactive
     except ModuleNotFoundError as exc:  # pragma: no cover - only without the CLI extra
@@ -572,7 +656,7 @@ def _tool_summary(name: str, args: dict[str, Any]) -> str:
 
 
 def serialize_event(event: dict[str, Any]) -> dict[str, Any]:
-    """JSON-safe event for --json / RPC output."""
+    """JSON-safe event for --json output."""
     out: dict[str, Any] = {"type": event.get("type"), **{key: event[key] for key in _EVENT_KEYS if key in event}}
     if "toolResults" in event:
         out["toolResults"] = [message_to_dict(m) for m in event["toolResults"]]
@@ -617,10 +701,11 @@ def run_print(session: AgentSession, prompt_text: str, quiet: bool = False) -> i
     captured: str | None = None
     last: AssistantMessage | None = None
     limit: str | None = None
+    plan: str | None = None
     stderr = sys.stderr
 
     def sink(event: dict[str, Any]) -> None:
-        nonlocal captured, last, limit
+        nonlocal captured, last, limit, plan
         etype = event.get("type")
         if etype == "message_end" and isinstance(event.get("message"), AssistantMessage):
             last = event["message"]
@@ -644,10 +729,19 @@ def run_print(session: AgentSession, prompt_text: str, quiet: bool = False) -> i
                 print(f"[limit] {limit}", file=stderr)
         elif etype == "compaction" and not quiet:
             print(f"[compaction] summarized {event.get('messagesSummarized')} messages", file=stderr)
+        elif etype == "plan_ready":
+            plan = str(event.get("plan") or "")
 
     if (code := _prompt(session, prompt_text, sink)) == 130:
         print("[aborted]", file=stderr)
         return code
+    if plan:
+        # The plan is the deliverable of a planning run: it goes to stdout, and
+        # the session keeps it for `tynex -c --permission-mode accept-edits`.
+        print(plan)
+        print("\n[plan] approve by rerunning with: tynex -c --permission-mode accept-edits", file=stderr)
+        sys.stdout.flush()
+        return 0
     if captured:
         print(captured)
         sys.stdout.flush()
@@ -669,160 +763,6 @@ def run_json(session: AgentSession, prompt_text: str) -> int:
             print(json.dumps(serialize_event(event), ensure_ascii=False, default=str), flush=True)
 
     return _prompt(session, prompt_text, sink)
-
-
-class RpcMode:
-    def __init__(self, session: AgentSession) -> None:
-        self.session = session
-        self._stdout_lock = threading.Lock()
-        self._commands: queue.Queue[dict[str, Any] | None] = queue.Queue()
-        self._worker: threading.Thread | None = None
-        self._shutdown = threading.Event()
-        self._queued_prompts = 0
-        self._abort_pending = threading.Event()
-
-    def _send(self, payload: dict[str, Any]) -> None:
-        with self._stdout_lock:
-            print(json.dumps(payload, ensure_ascii=False, default=str), flush=True)
-
-    def _respond(self, command: dict[str, Any], success: bool, data: Any = None, error: str | None = None) -> None:
-        payload = {"type": "response", "id": command.get("id"), "command": command.get("type"), "success": success}
-        if data is not None:
-            payload["data"] = data
-        if error is not None:
-            payload["error"] = error
-        self._send(payload)
-
-    def _emit_event(self, event: dict[str, Any]) -> None:
-        self._send({"type": "event", "event": serialize_event(event)})
-
-    def _worker_loop(self) -> None:
-        while not self._shutdown.is_set():
-            command = self._commands.get()
-            if command is None:
-                break
-            if command.get("type") == "prompt":
-                self._queued_prompts = max(0, self._queued_prompts - 1)
-                if self._abort_pending.is_set():
-                    self._abort_pending.clear()
-                    self._respond(command, True, {"state": self.session.stats(), "aborted": True})
-                    continue
-            try:
-                self._execute(command)
-            except Exception as exc:
-                self._respond(command, False, error=str(exc))
-
-    def _execute(self, command: dict[str, Any]) -> None:
-        ctype = command.get("type")
-        if ctype == "prompt":
-            self.session.prompt(str(command.get("message", "")), emit=self._emit_event)
-            data = {"state": self.session.stats()}
-        elif ctype == "set_model":
-            model = self.session.set_model_by_pattern(str(command.get("model", "")))
-            data = {"model": f"{model.provider}/{model.id}"}
-        elif ctype == "compact":
-            data = {"compacted": self.session.compact_now(command.get("instructions")), "state": self.session.stats()}
-        elif ctype == "new_session":
-            self.session.new_session()
-            data = {"sessionId": self.session.session.session_id}
-        elif ctype == "list_sessions":
-            sessions = list_sessions(self.session.cwd)
-            for info in sessions:
-                info.pop("cwd", None)
-            data = {"sessions": sessions}
-        elif ctype == "resume_session":
-            identifier = str(command.get("session", ""))
-            path = find_session(self.session.cwd, identifier)
-            if not path:
-                self._respond(command, False, error=f"No session matching {identifier!r}")
-                return
-            self.session.switch_session(path)
-            data = {"sessionId": self.session.session.session_id}
-        elif ctype == "set_permission_mode":
-            data = {"mode": self.session.set_permission_mode(str(command.get("mode", "")))}
-        elif ctype == "undo":
-            data = {"undone": [group.summary() for group in self.session.undo_last(int(command.get("count") or 1))]}
-        elif ctype == "shutdown":
-            self._respond(command, True, {})
-            self._shutdown.set()
-            return
-        else:
-            self._respond(command, False, error=f"Unknown command type: {ctype!r}")
-            return
-        self._respond(command, True, data)
-
-    def _handle_immediate(self, command: dict[str, Any]) -> bool:
-        ctype = command.get("type")
-        if ctype == "steer":
-            self.session.steer(str(command.get("message", "")))
-            self._respond(command, True, {"queued": "steer"})
-            return True
-        if ctype == "follow_up":
-            self.session.follow_up(str(command.get("message", "")))
-            self._respond(command, True, {"queued": "followUp"})
-            return True
-        if ctype == "abort":
-            if self._queued_prompts:
-                self._abort_pending.set()
-            self.session.abort()
-            self.session.finalize_aborted_turn(emit=self._emit_event)
-            self._respond(command, True, {})
-            return True
-        if ctype == "get_state":
-            stats = self.session.stats()
-            stats["running"] = self.session.running
-            stats["thinking"] = self.session.thinking
-            stats["tools"] = [tool.name for tool in self.session.tools]
-            self._respond(command, True, stats)
-            return True
-        if ctype == "get_messages":
-            self._respond(command, True, {"messages": [message_to_dict(m) for m in self.session.context.messages]})
-            return True
-        return False
-
-    def run(self) -> int:
-        self._worker = threading.Thread(target=self._worker_loop, daemon=True)
-        self._worker.start()
-        current = self.session.session
-        ready = {
-            "id": current.session_id,
-            "file": current.file_path,
-            "model": f"{self.session.model.provider}/{self.session.model.id}",
-            "cwd": self.session.cwd,
-        }
-        self._send({"type": "ready", "session": ready})
-        for raw in sys.stdin:
-            raw = raw.strip()
-            if not raw:
-                continue
-            try:
-                command = json.loads(raw)
-            except json.JSONDecodeError as exc:
-                self._send(
-                    {"type": "response", "id": None, "command": None, "success": False, "error": f"Invalid JSON: {exc}"}
-                )
-                continue
-            if not isinstance(command, dict):
-                continue
-            if self._handle_immediate(command):
-                if self._shutdown.is_set():
-                    break
-                continue
-            self._commands.put(command)
-            if command.get("type") == "prompt":
-                self._queued_prompts += 1
-            if command.get("type") == "shutdown":
-                self._commands.put(None)
-                break
-        self._commands.put(None)
-        if self._worker is not None:
-            self._worker.join(timeout=5)
-        self._shutdown.set()
-        return 0
-
-
-def run_rpc(session: AgentSession) -> int:
-    return RpcMode(session).run()
 
 
 if __name__ == "__main__":  # pragma: no cover

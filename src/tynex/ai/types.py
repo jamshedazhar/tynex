@@ -235,7 +235,7 @@ def message_text(message: Message) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Serialization (session files, JSON/RPC modes)
+# Serialization (session files, JSON mode)
 # ---------------------------------------------------------------------------
 
 

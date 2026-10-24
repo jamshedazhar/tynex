@@ -15,6 +15,8 @@ from click.testing import CliRunner
 
 import tynex.cli as cli_mod
 from tynex.agent.permissions import PermissionGate
+from tynex.ai.models import Model
+from tynex.ai.providers.base import THINKING_LEVELS, clamp_thinking
 from tynex.coding.settings import load_auth, store_api_key
 
 runner = CliRunner()
@@ -33,6 +35,15 @@ class FakeAgentSession:
         self.stealth = True
         self.tools: list[Any] = []
         self.permission_gate = PermissionGate(kwargs.get("permission_mode") or "accept-edits")
+        self.thinking = kwargs.get("thinking") or "off"
+        # Mirrors AgentSession: clamp to the model, and to its catalog levels.
+        self.thinking = clamp_thinking(self.thinking, self.available_thinking_levels())
+
+    def available_thinking_levels(self) -> list[str]:
+        if self.model is None or not self.model.reasoning:
+            return ["off"]
+        declared = set(self.model.thinking_levels)
+        return [level for level in THINKING_LEVELS if level == "off" or not declared or level in declared]
 
 
 @pytest.fixture
@@ -43,7 +54,6 @@ def fake_session(tmp_path, monkeypatch):
     # Keep the dispatch tests away from the real modes (which read stdin / run the agent).
     monkeypatch.setattr("tynex.cli.run_print", lambda *args, **kwargs: 0)
     monkeypatch.setattr("tynex.cli.run_json", lambda *args, **kwargs: 0)
-    monkeypatch.setattr("tynex.cli.run_rpc", lambda *args, **kwargs: 0)
     monkeypatch.setattr("tynex.tui.app.run_interactive", lambda *args, **kwargs: 0)
     return FakeAgentSession
 
@@ -312,19 +322,14 @@ def test_cli_print_mode_dispatch(fake_session, monkeypatch):
     assert "print mode requires a prompt" in result.stderr
 
 
-def test_cli_json_and_rpc_dispatch(fake_session, monkeypatch):
+def test_cli_json_dispatch(fake_session, monkeypatch):
     calls: list[tuple[str, str | None]] = []
 
     def run_json(session, prompt):
         calls.append(("json", prompt))
         return 0
 
-    def run_rpc(session):
-        calls.append(("rpc", None))
-        return 0
-
     monkeypatch.setattr("tynex.cli.run_json", run_json)
-    monkeypatch.setattr("tynex.cli.run_rpc", run_rpc)
 
     result = runner.invoke(cli_mod.cli, ["--json", "--model", "faux/test", "hi"])
     assert result.exit_code == 0
@@ -336,14 +341,11 @@ def test_cli_json_and_rpc_dispatch(fake_session, monkeypatch):
     result = runner.invoke(cli_mod.cli, ["--json", "--model", "faux/test"])
     assert result.exit_code == 2
     assert "json mode requires a prompt" in result.stderr
-
-    result = runner.invoke(cli_mod.cli, ["--rpc", "--model", "faux/test"])
-    assert result.exit_code == 0
-    assert calls == [("json", "hi"), ("json", "from stdin"), ("rpc", None)]
+    assert calls == [("json", "hi"), ("json", "from stdin")]
 
     conflict = runner.invoke(cli_mod.cli, ["-p", "--json", "--model", "faux/test", "hi"])
     assert conflict.exit_code == 2
-    assert "choose one of --print, --json or --rpc" in conflict.stderr
+    assert "choose one of --print or --json" in conflict.stderr
 
 
 # ---------------------------------------------------------------------------
@@ -403,3 +405,80 @@ def test_main_dispatches_auth_commands_and_errors(tmp_path, monkeypatch, capsys)
 
     monkeypatch.setattr(cli_mod.cli, "main", lambda **kwargs: None)
     assert cli_mod.main([]) == 0
+
+
+# ---------------------------------------------------------------------------
+# Run flags after the prompt
+# ---------------------------------------------------------------------------
+
+
+def _interactive_calls(monkeypatch) -> list[str | None]:
+    calls: list[str | None] = []
+
+    def interactive(session, initial_message=None):
+        calls.append(initial_message)
+        return 0
+
+    monkeypatch.setattr("tynex.tui.app.run_interactive", interactive)
+    return calls
+
+
+def test_cli_accepts_run_flags_after_the_prompt(fake_session, monkeypatch):
+    calls = _interactive_calls(monkeypatch)
+    result = runner.invoke(cli_mod.cli, ["hello", "world", "--permission-mode", "plan", "--model", "faux/test"])
+    assert result.exit_code == 0, result.output
+    assert calls == ["hello world"]
+    session = FakeAgentSession.last
+    assert session.kwargs["permission_mode"] == "plan"
+    assert session.model is not None and session.model.id == "test"
+
+
+def test_cli_keeps_unknown_flags_in_the_prompt(fake_session, monkeypatch):
+    calls = _interactive_calls(monkeypatch)
+    assert runner.invoke(cli_mod.cli, ["explain", "--tests", "please"]).exit_code == 0
+    assert calls == ["explain --tests please"]
+
+
+def test_cli_bare_resume_after_the_prompt_keeps_the_prompt(fake_session):
+    # ``--resume`` takes an optional value: hoisting it in front of the prompt
+    # must not turn the prompt into a session id.
+    ctx = cli_mod.cli.make_context("tynex", ["hello", "-c", "-p"])
+    assert ctx.params["resume"] == ""  # "" = the most recent session
+    assert ctx.params["print_mode"] is True
+    assert ctx.params["model"] is None
+    assert ctx.args == ["hello"]
+
+
+def test_cli_double_dash_ends_the_run_flags(fake_session, monkeypatch):
+    calls = _interactive_calls(monkeypatch)
+    assert runner.invoke(cli_mod.cli, ["--", "--permission-mode", "plan"]).exit_code == 0
+    assert calls == ["--permission-mode plan"]
+    assert FakeAgentSession.last.kwargs["permission_mode"] is None
+
+
+def test_cli_warns_when_thinking_is_not_available(fake_session, tmp_path):
+    result = runner.invoke(cli_mod.cli, ["-p", "--model", "faux/test", "--thinking", "high", "hi"])
+    assert result.exit_code == 0, result.output
+    assert "needs a reasoning model" in result.stderr
+    assert "using 'off'" in result.stderr
+
+    result = runner.invoke(cli_mod.cli, ["-p", "--model", "anthropic/claude-sonnet-4-5", "--thinking", "high", "hi"])
+    assert result.exit_code == 0, result.output
+    assert "needs a reasoning model" not in result.stderr
+
+
+def test_cli_explains_a_level_the_model_does_not_offer(fake_session, monkeypatch):
+    # DeepSeek lists low/high/max: --thinking medium becomes high, and says so.
+    model = Model(
+        id="deepseek-flash",
+        name="DeepSeek-V4.1-Flash",
+        provider="deepseek",
+        api="openai-completions",
+        reasoning=True,
+        thinking_levels=("low", "high", "max"),
+    )
+    monkeypatch.setattr(cli_mod, "resolve_model_retry", lambda *args, **kwargs: model)
+    result = runner.invoke(cli_mod.cli, ["-p", "--model", "deepseek/deepseek-flash", "--thinking", "medium", "hi"])
+    assert result.exit_code == 0, result.output
+    assert "not offered by" in result.stderr and "using 'high'" in result.stderr
+    assert "needs a reasoning model" not in result.stderr

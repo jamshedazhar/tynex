@@ -1,7 +1,7 @@
 # AGENTS.md
 
 Tynex (`tynex`) is a Python 3.12+ terminal coding agent harness. One agent loop
-backs the TUI, headless print/JSON/RPC modes, and the SDK.
+backs the TUI, headless print/JSON modes, and the SDK.
 
 ## Commands
 
