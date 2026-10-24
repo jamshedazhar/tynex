@@ -56,11 +56,11 @@ def test_state_counts_usage_and_exceeded_reasons():
     usage = Usage(input=100, output=50, cache_read=25, cache_write=5, cost=0.25)
     usage.total_tokens = 150
     state.add_usage(usage)
-    assert state.tokens == 175  # input + output + cache read
+    assert state.tokens == 180  # input + output + cache read + cache write
     assert state.cost_usd == 0.25
 
-    assert state.exceeded(BudgetLimits(max_tokens=176)) is None
-    assert "token limit" in state.exceeded(BudgetLimits(max_tokens=175))
+    assert state.exceeded(BudgetLimits(max_tokens=181)) is None
+    assert "token limit" in state.exceeded(BudgetLimits(max_tokens=180))
     assert "cost limit" in state.exceeded(BudgetLimits(max_cost_usd=0.2))
     assert state.exceeded(BudgetLimits(max_cost_usd=0.25)) is not None  # >=
 
@@ -202,4 +202,13 @@ def test_usage_totals_and_stats_include_cache(tmp_path, faux_model):
     session.prompt("go", emit=lambda event: None)
     totals = session.usage_totals()
     assert totals.input == 10 and totals.output == 5
-    assert session.budget.tokens == 18  # input + output + cache read
+    assert session.budget.tokens == 20  # input + output + cache read + cache write
+
+
+def test_usage_without_a_total_still_counts_against_the_budget():
+    # Anthropic reports input/output/cache tokens and never a total; a token cap
+    # that read only ``total_tokens`` would never fire for Claude.
+    state = BudgetState()
+    state.add_usage(Usage(input=10, output=5, cache_read=3, cache_write=30_000))
+    assert state.tokens == 30_018
+    assert state.exceeded(BudgetLimits(max_tokens=30_018)) is not None
