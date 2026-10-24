@@ -160,7 +160,15 @@ class PermissionGate:
             subject = str(tool.permission_subject(args) or "")
         except Exception:
             subject = ""
-        subjects = [subject, *(str(v) for v in args.values() if isinstance(v, str))]
+        subjects = (
+            [subject]
+            if subject
+            else [
+                str(args[key])
+                for key in ("path", "command", "query", "url", "glob", "pattern", "name")
+                if isinstance(args.get(key), str) and args[key]
+            ]
+        )
         request = PermissionRequest(tool_name=tool_name, kind=kind, subject=subject, args=dict(args))
 
         action = self._mode_action(kind)

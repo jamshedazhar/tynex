@@ -6,14 +6,12 @@ branches: pure helpers, the Renderer event mapping and the InteractiveApp
 command/model/login plumbing.
 """
 
-import io
 import threading
 import time
 from pathlib import Path
 from typing import Any
 
 from prompt_toolkit.formatted_text import to_formatted_text
-from rich.console import Console
 
 from tests.conftest import faux_scenario, text_scenario
 from tynex.agent.permissions import PermissionRequest
@@ -36,6 +34,7 @@ from tynex.tui import app as interactive
 from tynex.tui.app import InteractiveApp
 from tynex.tui.prompt import _prompt_key_bindings
 from tynex.tui.renderer import Renderer, display_cwd, footer_text, running_text
+from tynex.tui.transcript import Transcript
 
 # Keep Rich from wrapping long temporary paths differently on each platform.
 CONSOLE_WIDTH = 300
@@ -73,15 +72,12 @@ def make_app(
     tmp_path: Path, *, model: Model | None = None, terminal: bool = False, tool_names: list[str] | None = None
 ) -> InteractiveApp:
     session = AgentSession(cwd=str(tmp_path), model=model, tool_names=tool_names or [], no_session=True)
-    if terminal:
-        console = Console(file=io.StringIO(), force_terminal=True, no_color=True, highlight=False, width=CONSOLE_WIDTH)
-    else:
-        console = Console(file=io.StringIO(), width=CONSOLE_WIDTH, highlight=False)
-    return InteractiveApp(session, console=console)
+    # The console writes into the transcript, so command output is inspectable.
+    return InteractiveApp(session, terminal=terminal)
 
 
 def output(app: InteractiveApp) -> str:
-    return app.console.file.getvalue()  # type: ignore[union-attr]
+    return app.transcript.text()
 
 
 # ---------------------------------------------------------------------------
@@ -89,21 +85,20 @@ def output(app: InteractiveApp) -> str:
 # ---------------------------------------------------------------------------
 
 
-def make_renderer(tmp_path: Path, **session_kwargs: Any) -> tuple[Renderer, io.StringIO]:
+def make_renderer(tmp_path: Path, **session_kwargs: Any) -> tuple[Renderer, Transcript]:
     session = AgentSession(cwd=str(tmp_path), tool_names=[], no_session=True, **session_kwargs)
-    buffer = io.StringIO()
-    console = Console(file=buffer, width=CONSOLE_WIDTH, highlight=False)
-    return Renderer(session, console), buffer
+    transcript = Transcript()
+    return Renderer(session, transcript), transcript
 
 
 def test_renderer_echoes_user_message_and_honours_echo_flag(tmp_path):
     renderer, buffer = make_renderer(tmp_path)
     renderer.handle({"type": "message_start", "message": UserMessage(content="hello there")})
-    assert "❯ hello there" in buffer.getvalue()  # noqa: RUF001 — intentional prompt glyph
+    assert "❯ hello there" in buffer.text()  # noqa: RUF001 — intentional prompt glyph
 
     renderer.echo_user = False
     renderer.handle({"type": "message_start", "message": UserMessage(content="hidden message")})
-    assert "hidden message" not in buffer.getvalue()
+    assert "hidden message" not in buffer.text()
 
 
 def test_renderer_streams_markdown_paragraphs_without_splitting_code(tmp_path):
@@ -119,14 +114,14 @@ def test_renderer_streams_markdown_paragraphs_without_splitting_code(tmp_path):
     )
     # The first two blocks are complete (the blank lines are outside fences),
     # so they render while the rest is still streaming.
-    assert "Intro" in buffer.getvalue() and "x = 1" in buffer.getvalue() and "y = 2" in buffer.getvalue()
-    assert "Outro" not in buffer.getvalue()
+    assert "Intro" in buffer.text() and "x = 1" in buffer.text() and "y = 2" in buffer.text()
+    assert "Outro" not in buffer.text()
     assert renderer._text.endswith("Outro")
 
     message.content = [TextContent(text="Intro")]
     message.stop_reason = "stop"
     renderer.handle({"type": "message_end", "message": message})
-    out = buffer.getvalue()
+    out = buffer.text()
     assert out.count("Intro") == 1 and out.count("Outro") == 1  # no duplicate render
     assert renderer._text == ""
 
@@ -141,7 +136,7 @@ def test_renderer_streams_many_chunks_without_duplicates(tmp_path):
     message.stop_reason = "stop"
     renderer.handle({"type": "message_end", "message": message})
 
-    out = buffer.getvalue()
+    out = buffer.text()
     assert all(out.count(f"Paragraph {index}.") == 1 for index in range(30))
     assert out.count("tail") == 1
 
@@ -151,12 +146,12 @@ def test_renderer_flushes_a_short_message_on_end_once(tmp_path):
     message = AssistantMessage(api="faux", provider="faux", model="test")
     renderer.handle({"type": "message_start", "message": message})
     renderer.handle({"type": "message_update", "delta": {"type": "text_delta", "delta": "Hello **world**"}})
-    assert buffer.getvalue() == ""  # no blank line yet: wait for the end
+    assert buffer.text() == ""  # no blank line yet: wait for the end
 
     message.content = [TextContent(text="Hello **world**")]
     message.stop_reason = "stop"
     renderer.handle({"type": "message_end", "message": message})
-    assert buffer.getvalue().count("Hello") == 1
+    assert buffer.text().count("Hello") == 1
 
 
 def test_renderer_activity_reports_thinking_text_and_tools(tmp_path):
@@ -173,10 +168,10 @@ def test_renderer_activity_reports_thinking_text_and_tools(tmp_path):
 
     renderer.handle({"type": "tool_execution_start", "toolName": "bash", "args": {"command": "ls"}})
     assert renderer.activity() == "⚙ bash"
-    assert "$ ls" in buffer.getvalue()
+    assert "$ ls" in buffer.text()
     renderer.handle({"type": "tool_execution_end", "toolName": "bash"})
     assert renderer.activity() is None
-    assert "(no output)" in buffer.getvalue()
+    assert "(no output)" in buffer.text()
 
     # Streamed text shows its latest line while it arrives.
     renderer.handle({"type": "message_start", "message": AssistantMessage()})
@@ -187,27 +182,27 @@ def test_renderer_activity_reports_thinking_text_and_tools(tmp_path):
 def test_renderer_message_end_error_aborted_and_tool_turn(tmp_path):
     renderer, buffer = make_renderer(tmp_path)
     renderer.handle({"type": "message_end", "message": AssistantMessage(stop_reason="error", error_message="boom")})
-    assert "✗ boom" in buffer.getvalue()
+    assert "✗ boom" in buffer.text()
 
     renderer, buffer = make_renderer(tmp_path)
     renderer.handle({"type": "message_end", "message": AssistantMessage(stop_reason="error")})
-    assert "Provider error" in buffer.getvalue()
+    assert "Provider error" in buffer.text()
 
     renderer, buffer = make_renderer(tmp_path)
     renderer.handle({"type": "message_end", "message": AssistantMessage(stop_reason="aborted")})
-    assert "aborted" in buffer.getvalue()
+    assert "aborted" in buffer.text()
 
     # A tool-use turn with no text stays quiet (no empty markdown, no error line).
     renderer, buffer = make_renderer(tmp_path)
     renderer.handle({"type": "message_end", "message": AssistantMessage(stop_reason="toolUse")})
-    assert buffer.getvalue().strip() == ""
+    assert buffer.text().strip() == ""
 
 
 def test_renderer_tool_lifecycle_prints_header_and_summaries(tmp_path):
     renderer, buffer = make_renderer(tmp_path)
 
     renderer.handle({"type": "tool_execution_start", "toolName": "read", "args": {"path": "notes.txt"}})
-    assert "read" in buffer.getvalue() and "notes.txt" in buffer.getvalue()
+    assert "read" in buffer.text() and "notes.txt" in buffer.text()
     renderer.handle(
         {
             "type": "tool_execution_end",
@@ -215,7 +210,7 @@ def test_renderer_tool_lifecycle_prints_header_and_summaries(tmp_path):
             "result": ToolResultMessage(tool_call_id="c2", tool_name="read", content=[TextContent(text="a\nb\nc")]),
         }
     )
-    assert "↳ 3 lines · 0.0" in buffer.getvalue()
+    assert "↳ 3 lines · 0.0" in buffer.text()
 
     renderer.handle({"type": "tool_execution_start", "toolName": "bash", "args": {"command": "false"}})
     renderer.handle(
@@ -228,17 +223,57 @@ def test_renderer_tool_lifecycle_prints_header_and_summaries(tmp_path):
             ),
         }
     )
-    assert "✗ line one" in buffer.getvalue()
+    assert "✗ line one" in buffer.text()
 
     renderer.handle({"type": "tool_execution_start", "toolName": "ls", "args": {"path": "."}})
     renderer.handle({"type": "tool_execution_end", "toolName": "ls"})
-    assert "(no output)" in buffer.getvalue()
+    assert "(no output)" in buffer.text()
+
+
+def test_renderer_keeps_the_full_tool_input_and_output_for_expansion(tmp_path):
+    renderer, transcript = make_renderer(tmp_path)
+    command = "python -c 'print(1)' " + "arg" * 120  # far past the 100-char header
+    output = "\n".join(f"line {index}" for index in range(1, 60))
+    renderer.handle({"type": "tool_execution_start", "toolName": "bash", "args": {"command": command}})
+    renderer.handle(
+        {
+            "type": "tool_execution_end",
+            "toolName": "bash",
+            "result": ToolResultMessage(tool_call_id="c4", tool_name="bash", content=[TextContent(text=output)]),
+        }
+    )
+
+    block = transcript.last_tool()
+    assert block is not None and block.expandable
+    # Nothing is cut: the block holds the whole command and the whole output.
+    assert command in block.detail
+    assert all(f"line {index}" in block.detail for index in range(1, 60))
+    # Collapsed, the transcript shows the one-line header and summary only.
+    assert "line 30" not in transcript.text()
+    assert transcript.toggle(block) and block.expanded
+
+
+def test_renderer_prints_file_contents_as_text_when_expanded(tmp_path):
+    renderer, transcript = make_renderer(tmp_path)
+    content = "\n".join(f"line {index} of the new file" for index in range(1, 120))
+    renderer.handle(
+        {"type": "tool_execution_start", "toolName": "write", "args": {"path": "new.py", "content": content}}
+    )
+    block = transcript.last_tool()
+    assert block is not None
+    assert "line 90 of the new file" not in transcript.text()  # collapsed
+
+    transcript.toggle(block)
+    expanded = transcript.text()
+    # The content is shown as text, not as one JSON-escaped line.
+    assert "line 90 of the new file" in expanded and "line 119 of the new file" in expanded
+    assert "\\n" not in expanded
 
 
 def test_renderer_compaction_and_agent_end(tmp_path):
     renderer, buffer = make_renderer(tmp_path)
     renderer.handle({"type": "compaction", "messagesSummarized": 4, "tokensBefore": 12_000})
-    assert "compacted 4 messages" in buffer.getvalue() and "12.0k tokens" in buffer.getvalue()
+    assert "compacted 4 messages" in buffer.text() and "12.0k tokens" in buffer.text()
 
     renderer.handle({"type": "tool_execution_start", "toolName": "ls", "args": {}})
     renderer.handle({"type": "agent_end"})
@@ -261,18 +296,36 @@ def test_renderer_swallows_handler_errors(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_prompt_shows_running_status_above_the_input(tmp_path, monkeypatch):
+def test_status_line_shows_the_run_and_the_prompt_stays_single_line(tmp_path, monkeypatch):
     app = make_app(tmp_path, model=resolve_model("faux/test"))
     idle = "".join(fragment for _, fragment in to_formatted_text(app._prompt()))
     assert "\n" not in idle and idle.endswith("❯ ")  # noqa: RUF001
+    assert "".join(fragment for _, fragment in to_formatted_text(app._status())) == ""
 
     monkeypatch.setattr(app, "_busy", lambda: True)
     app.renderer._tool = "bash"
     app.session.steer("later")
-    running = "".join(fragment for _, fragment in to_formatted_text(app._prompt()))
+    running = "".join(fragment for _, fragment in to_formatted_text(app._status()))
     assert running.startswith("● running")
-    assert "\n❯ " in running  # noqa: RUF001 — status line, then the input prompt
     assert "⚙ bash" in running and "1 queued" in running and "esc to interrupt" in running
+    # The status is its own row in the docked layout; the prompt stays one line.
+    assert "\n" not in "".join(fragment for _, fragment in to_formatted_text(app._prompt()))
+
+
+def test_usage_line_counts_a_cache_write_and_needs_no_total(tmp_path):
+    # Anthropic's first turn reports a cache write and no ``total_tokens``.
+    renderer, transcript = make_renderer(tmp_path)
+    usage = Usage(input=10, output=5, cache_write=30_000)
+    renderer.handle(
+        {
+            "type": "message_end",
+            "message": AssistantMessage(provider="anthropic", api="anthropic", model="x", usage=usage),
+        }
+    )
+    text = transcript.text()
+    assert "in · 5 out" in text  # the line is printed at all
+    assert "30.0k in" in text  # input + cache write, not just input
+    assert "30.0k cache write" in text
 
 
 def test_footer_text_reports_model_think_usage_and_context(tmp_path):
@@ -296,6 +349,11 @@ def test_footer_text_reports_model_think_usage_and_context(tmp_path):
     assert "1 queued" in footer_text(app.session)  # survives an aborted/ended turn
     assert "ctx 85%" in footer_text(app.session, context=(85_000, 100_000))
     assert "/compact" in footer_text(app.session, context=(85_000, 100_000))
+
+    # A pending plan is the next action, so the footer names the command.
+    assert "plan awaiting /approve" not in footer_text(app.session)
+    app.session.pending_plan = {"id": "e1", "plan": "do it"}
+    assert "plan awaiting /approve" in footer_text(app.session)
 
 
 # ---------------------------------------------------------------------------
@@ -378,6 +436,9 @@ def test_handle_command_quit_empty_and_unknown(tmp_path):
     assert app._handle_command("/") is None
     assert app._handle_command("/nope") is None
     assert "Unknown command /nope" in output(app)
+    # A near miss names the command the user probably meant.
+    assert app._handle_command("/permisions") is None
+    assert "Did you mean /permissions?" in output(app)
 
 
 def test_handle_command_help_stats_and_cwd(tmp_path):
@@ -418,11 +479,8 @@ def test_handle_command_model_switches_and_reports_errors(tmp_path, monkeypatch)
 def test_handle_command_routes_helpers(tmp_path, monkeypatch):
     app = make_app(tmp_path, model=resolve_model("faux/test"))
     called: list[str] = []
-    monkeypatch.setattr(session_commands, "tree", lambda *a: called.append(f"tree:{a[2]}"))
     monkeypatch.setattr(session_commands, "resume", lambda *a: called.append(f"resume:{a[2]}"))
     monkeypatch.setattr(session_commands, "thinking", lambda *a: called.append(f"thinking:{a[2]}"))
-    monkeypatch.setattr(session_commands, "fork", lambda *a: called.append(f"fork:{a[2]}"))
-    monkeypatch.setattr(session_commands, "clone", lambda *a: called.append("clone"))
     monkeypatch.setattr(session_commands, "export_session", lambda *a: called.append(f"export:{a[2]}"))
     monkeypatch.setattr(session_commands, "session_info", lambda *a: called.append("session"))
     monkeypatch.setattr(coding_signin, "login", lambda *a: called.append(f"login:{a[1]}"))
@@ -430,15 +488,11 @@ def test_handle_command_routes_helpers(tmp_path, monkeypatch):
     monkeypatch.setattr(app.session, "compact_now", lambda arg=None: arg != "skip")
     monkeypatch.setattr(app.session, "new_session", lambda: called.append("new"))
 
-    app._handle_command("/tree abc123")
     app._handle_command("/resume 2020")
     app._handle_command("/sessions")
     app._handle_command("/login anthropic")
     app._handle_command("/logout")
     app._handle_command("/thinking high")
-    app._handle_command("/fork")
-    app._handle_command("/fork abc123")
-    app._handle_command("/clone")
     app._handle_command("/export out.html")
     app._handle_command("/session")
     app._handle_command("/stats")
@@ -449,15 +503,11 @@ def test_handle_command_routes_helpers(tmp_path, monkeypatch):
     app._handle_command("/new")
     assert "New session" in output(app)
     assert called == [
-        "tree:abc123",
         "resume:2020",
         "resume:",
         "login:anthropic",
         "logout:",
         "thinking:high",
-        "fork:",
-        "fork:abc123",
-        "clone",
         "export:out.html",
         "session",
         "session",
@@ -546,34 +596,8 @@ def test_pick_model_selecting_current_model_is_a_noop(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# InteractiveApp: /tree and /resume
+# InteractiveApp: /resume
 # ---------------------------------------------------------------------------
-
-
-def test_tree_lists_entries_and_marks_current(tmp_path, monkeypatch):
-    app = make_app(tmp_path)
-    entries = [Entry("aaaa1111", "user: hi"), Entry("bbbb2222", "assistant: done")]
-    monkeypatch.setattr(app.session.session, "path_entries", lambda: entries)
-    monkeypatch.setattr(app.session.session, "current_leaf_id", "bbbb2222")
-
-    app._handle_command("/tree")
-    out = output(app)
-    assert "aaaa1111" in out and "user: hi" in out
-    assert "assistant: done" in out
-    assert "/tree <entry-id> to branch from an entry." in out
-
-
-def test_tree_branches_to_entry(tmp_path, monkeypatch):
-    app = make_app(tmp_path)
-    entry = Entry("abcd1234", "user: hi")
-    monkeypatch.setattr(app.session.session, "branch_to", lambda arg: entry if arg == "abcd" else None)
-    monkeypatch.setattr(app.session.session, "branch_messages", lambda: [])
-
-    app._handle_command("/tree abcd")
-    assert "Branched to abcd1234" in output(app)
-
-    app._handle_command("/tree zzz")
-    assert "No unique entry matching 'zzz'" in output(app)
 
 
 def test_resume_without_sessions(tmp_path):
@@ -805,31 +829,24 @@ def test_prompt_key_bindings_alt_enter_inserts_a_newline():
     assert inserted == ["\n"]
 
 
-def test_prompt_writer_schedules_output_above_a_running_prompt():
-    from prompt_toolkit import PromptSession
-    from prompt_toolkit.application.current import create_app_session
-    from prompt_toolkit.input import create_pipe_input
-    from prompt_toolkit.output import DummyOutput
+def test_transcript_writer_feeds_console_output_into_the_transcript(tmp_path):
+    app = make_app(tmp_path)
+    changes: list[int] = []
+    app.transcript.on_change = lambda: changes.append(1)
 
-    with create_pipe_input() as pipe, create_app_session(input=pipe, output=DummyOutput()):
-        writer = interactive._PromptWriter()
-        prompt = PromptSession(input=pipe, output=DummyOutput())
-        answers: list[str] = []
-        thread = threading.Thread(target=lambda: answers.append(prompt.prompt("> ")))
-        thread.start()
-        try:
-            deadline = time.monotonic() + 10
-            while not prompt.app.is_running and time.monotonic() < deadline:
-                time.sleep(0.01)
-            writer.write("streamed output above the prompt\n")
-            pipe.send_text("typed\r")
-        finally:
-            thread.join(10)
-        assert answers == ["typed"]
+    app.console.print("streamed [bold]output[/] from the agent thread")
+    assert "streamed output from the agent thread" in output(app)
+    assert changes, "the docked prompt must be asked to repaint"
+
+    # The writer is a real file object: no console escape codes, no fileno.
+    writer = interactive._TranscriptWriter(app.transcript)
+    writer.write("raw line\n")
+    writer.flush()
+    assert "raw line" in output(app)
+    assert writer.isatty() is False and writer.encoding == "utf-8"
 
 
 def test_prompt_accepts_input_and_escape_interrupts_while_running(tmp_path, monkeypatch):
-    from prompt_toolkit import PromptSession
     from prompt_toolkit.input import create_pipe_input
     from prompt_toolkit.output import DummyOutput
 
@@ -855,13 +872,15 @@ def test_prompt_accepts_input_and_escape_interrupts_while_running(tmp_path, monk
 
     monkeypatch.setattr(app.session, "prompt", fake_prompt)
     with create_pipe_input() as pipe:
-        app._input = PromptSession(
+        app._input = interactive.DockedPrompt(
+            app.transcript,
+            status=app._status,
             key_bindings=_prompt_key_bindings(interrupt=app._interrupt_run, is_busy=app._busy),
             input=pipe,
             output=DummyOutput(),
         )
         answers: list[str] = []
-        prompt_thread = threading.Thread(target=lambda: answers.append(app.input.prompt("> ")))
+        prompt_thread = threading.Thread(target=lambda: answers.append(app.input.prompt(app._prompt())))
         prompt_thread.start()
         wait_until(lambda: app.input.app.is_running, "the prompt to start")
 
@@ -888,14 +907,13 @@ def test_prompt_accepts_input_and_escape_interrupts_while_running(tmp_path, monk
 
 
 def test_ask_masks_only_the_password_question(tmp_path):
-    from prompt_toolkit import PromptSession
     from prompt_toolkit.input import create_pipe_input
     from prompt_toolkit.output import DummyOutput
 
     app = make_app(tmp_path, model=resolve_model("faux/test"))
     answers: list[str] = []
     with create_pipe_input() as pipe:
-        session = PromptSession(input=pipe, output=DummyOutput())
+        session = interactive.DockedPrompt(app.transcript, input=pipe, output=DummyOutput())
         app._input = session
 
         def ask(text: str, **kwargs: Any) -> threading.Thread:
@@ -1169,7 +1187,7 @@ def test_switch_to_provider_if_unusable(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# InteractiveApp: thinking, /session, logout, fork/clone/export
+# InteractiveApp: thinking, /session, logout, export
 # ---------------------------------------------------------------------------
 
 
@@ -1177,8 +1195,7 @@ def make_persistent_app(tmp_path: Path, *, session_file: str = "session.jsonl") 
     session = AgentSession(
         cwd=str(tmp_path), model=resolve_model("faux/test"), tool_names=[], session_file=str(tmp_path / session_file)
     )
-    console = Console(file=io.StringIO(), width=CONSOLE_WIDTH, highlight=False)
-    return InteractiveApp(session, console=console)
+    return InteractiveApp(session)
 
 
 def append_exchange(app: InteractiveApp, user_text: str, assistant_text: str):
@@ -1221,9 +1238,40 @@ def test_thinking_command_rejects_levels_the_model_lacks(tmp_path):
     assert app.session.available_thinking_levels() == ["off"]
 
     app._handle_command("/thinking high")
-    assert "not available for this model" in output(app)
+    out = output(app)
+    assert "needs a reasoning model" in out
+    assert "faux/test does not support thinking" in out
+    assert "/model" in out and "/thinking off" in out
     assert app.session.thinking == "off"
     assert not [e for e in app.session.session.entries if e.type == "thinking_level_change"]
+
+    # Without a model at all the same question has a different answer.
+    unset = make_app(tmp_path)
+    assert unset.session.model is None
+    unset._handle_command("/thinking high")
+    assert "none is selected" in output(unset)
+
+
+def test_thinking_levels_follow_the_catalog_and_clamp_to_the_nearest(tmp_path):
+    # DeepSeek's catalog lists low/high/max; the old code offered only "off".
+    model = Model(
+        id="deepseek-flash",
+        name="DeepSeek-V4.1-Flash",
+        provider="deepseek",
+        api="openai-completions",
+        reasoning=True,
+        thinking_levels=("low", "high", "max"),
+    )
+    app = make_app(tmp_path, model=model)
+    assert app.session.available_thinking_levels() == ["off", "low", "high", "max"]
+
+    app._handle_command("/thinking")  # non-terminal: lists instead of picking
+    assert "available: off, low, high, max" in output(app)
+
+    app._handle_command("/thinking medium")  # not offered: the nearest level wins
+    out = output(app)
+    assert "medium is not offered" in out and "using high" in out
+    assert app.session.thinking == "high"
 
 
 def test_session_command_reports_pi_stats(tmp_path):
@@ -1256,9 +1304,9 @@ def test_budget_command_shows_limits_and_hides_unused_rows(tmp_path):
     assert "Budget" not in out and "$0.0000" not in out  # no limits, no usage: nothing to show
 
     session = AgentSession(cwd=str(tmp_path), tool_names=[], no_session=True, budget=BudgetLimits(max_tokens=5))
-    limited = InteractiveApp(session, console=Console(file=io.StringIO(), width=CONSOLE_WIDTH, highlight=False))
+    limited = InteractiveApp(session)
     limited._handle_command("/budget")
-    out = limited.console.file.getvalue()
+    out = output(limited)
     assert "tokens" in out and "0 / 5" in out
     assert "cost" not in out  # no cost limit
 
@@ -1295,98 +1343,6 @@ def test_logout_reports_oauth_providers(tmp_path):
     assert "Logged out of GitHub Copilot" in output(app)
 
 
-def test_fork_command_lists_and_forks(tmp_path):
-    app = make_persistent_app(tmp_path)
-    first, _ = append_exchange(app, "first question", "first answer")
-    second, _ = append_exchange(app, "second question", "second answer")
-
-    app._handle_command("/fork")
-    out = output(app)
-    assert first.id[:8] in out and second.id[:8] in out
-    assert "first question" in out
-
-    old_id = app.session.session.session_id
-    app._handle_command(f"/fork {second.id}")
-    out = output(app)
-    assert "Forked to new session" in out
-    assert app._prefill == "second question"
-    assert app.session.session.session_id != old_id
-    assert [m.text() for m in app.session.context.messages] == ["first question", "first answer"]
-
-    app._handle_command(f"/fork {second.id}")  # stale ids from the old session are gone
-    assert "Invalid entry ID for forking" in output(app)
-
-
-def test_fork_uses_a_picker_on_a_terminal(tmp_path, monkeypatch):
-    app = make_persistent_app(tmp_path)
-    append_exchange(app, "first question", "first answer")
-    append_exchange(app, "second question", "second answer")
-    app.console = Console(file=io.StringIO(), force_terminal=True, no_color=True, highlight=False, width=CONSOLE_WIDTH)
-    seen: dict[str, Any] = {}
-
-    def fake_select(title, options, *, selected=0):
-        seen["title"] = title
-        seen["options"] = list(options)
-        return 1
-
-    monkeypatch.setattr(interactive, "select_option", fake_select)
-    app._handle_command("/fork")
-    assert seen["title"] == "Fork before which user message?"
-    assert len(seen["options"]) == 2
-    assert app._prefill == "second question"
-
-
-def test_fork_picker_interrupt_does_not_fork(tmp_path, monkeypatch):
-    # An interrupted picker must not be taken as a row index: -1 would silently
-    # fork before the last candidate.
-    app = make_persistent_app(tmp_path)
-    append_exchange(app, "first question", "first answer")
-    app.console = Console(file=io.StringIO(), force_terminal=True, no_color=True, highlight=False, width=CONSOLE_WIDTH)
-    session_id = app.session.session.session_id
-
-    def interrupted(title: str, options: list[str], *, selected: int = 0) -> int:
-        raise KeyboardInterrupt
-
-    monkeypatch.setattr(interactive, "select_option", interrupted)
-    app._handle_command("/fork")
-    assert app.session.session.session_id == session_id
-    assert app._prefill == ""
-
-
-def test_fork_before_first_message_starts_empty(tmp_path):
-    app = make_persistent_app(tmp_path)
-    first, _ = append_exchange(app, "only question", "only answer")
-    app._handle_command(f"/fork {first.id}")
-    assert app._prefill == "only question"
-    assert app.session.context.messages == []
-
-
-def test_clone_command_duplicates_current_branch(tmp_path):
-    app = make_persistent_app(tmp_path)
-    append_exchange(app, "hello", "hi")
-    old_id = app.session.session.session_id
-    old_file = app.session.session.file_path
-
-    app._handle_command("/clone")
-    out = output(app)
-    assert "Cloned to new session" in out
-    assert app.session.session.session_id != old_id
-    assert app.session.session.file_path != old_file
-    assert Path(old_file).is_file()
-    assert [m.text() for m in app.session.context.messages] == ["hello", "hi"]
-    assert app.session.session.entries[0].data["parentSession"] == old_file
-
-
-def test_clone_reports_nothing_to_clone(tmp_path):
-    app = make_persistent_app(tmp_path)
-    app._handle_command("/clone")
-    assert "Nothing to clone yet" in output(app)
-
-    empty = make_app(tmp_path)  # no-session app without any entries
-    empty._handle_command("/clone")
-    assert "Nothing to clone yet" in output(empty)
-
-
 def test_export_writes_jsonl_and_html(tmp_path):
     import json
 
@@ -1421,7 +1377,7 @@ def test_export_writes_jsonl_and_html(tmp_path):
     assert list(tmp_path.glob("tynex-session-*.html"))
 
 
-def test_run_prefills_editor_after_fork(tmp_path, monkeypatch):
+def test_run_prefills_the_editor(tmp_path, monkeypatch):
     app = make_app(tmp_path)
     prompt = FakePrompt("edited question", EOFError())
     app._input = prompt
@@ -1433,6 +1389,52 @@ def test_run_prefills_editor_after_fork(tmp_path, monkeypatch):
     assert app.run() == 0
     assert seen == ["edited question"]
     assert prompt.defaults == ["first question", ""]
+
+
+# ---------------------------------------------------------------------------
+# InteractiveApp: plan approval
+# ---------------------------------------------------------------------------
+
+
+def test_drain_plans_approves_once_and_skips_stale_events(tmp_path, monkeypatch):
+    app = make_app(tmp_path, model=resolve_model("faux/test"), terminal=True)
+    app.session.pending_plan = {"id": "plan-1", "plan": "## Plan"}
+    app._plans.put({"type": "plan_ready", "planId": "plan-1", "plan": "## Plan"})
+    app._plans.put({"type": "plan_ready", "planId": "plan-1", "plan": "## Plan"})  # already decided
+    monkeypatch.setattr(app, "_ask", lambda text: "y")
+    submitted: list[str] = []
+    monkeypatch.setattr(app, "_submit", lambda text, **kwargs: submitted.append(text))
+
+    app._drain_plans()
+
+    assert app.session.permission_gate.mode == "accept-edits"
+    assert submitted == ["Execute the approved plan."]
+
+
+def test_submit_queues_until_the_active_run_finishes(tmp_path, monkeypatch):
+    app = make_app(tmp_path, model=resolve_model("faux/test"))
+    started = threading.Event()
+    release = threading.Event()
+    seen: list[str] = []
+
+    def fake_prompt(text: str, emit: Any = None) -> None:
+        seen.append(text)
+        started.set()
+        release.wait(5)
+
+    monkeypatch.setattr(app.session, "prompt", fake_prompt)
+    app._submit("first")
+    assert started.wait(5)
+    app._submit("second")
+    assert seen == ["first"]  # queued, not a concurrent session.prompt()
+    assert app._busy()
+
+    release.set()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and (seen != ["first", "second"] or app._busy()):
+        time.sleep(0.01)
+    assert seen == ["first", "second"]
+    assert not app._busy()
 
 
 # ---------------------------------------------------------------------------
@@ -1513,3 +1515,44 @@ def test_tui_run_asks_for_approval_and_runs_the_tool(tmp_path, monkeypatch):
     permissions = [entry for entry in app.session.session.entries if entry.type == "permission"]
     assert [entry.data["action"] for entry in permissions] == ["allow"]
     assert any("tui-approved" in str(getattr(message, "content", "")) for message in app.session.context.messages)
+
+
+def test_prompt_approval_asks_on_the_input_line_and_maps_answers(tmp_path, monkeypatch):
+    app = make_app(tmp_path)
+    answers = iter(["y", "yes", " a ", "always", "", "n"])
+    monkeypatch.setattr(app, "_ask", lambda text: next(answers))
+    request = PermissionRequest(tool_name="bash", kind="shell", subject="echo hi")
+
+    assert [app._prompt_approval(request) for _ in range(6)] == ["allow", "allow", "session", "session", "deny", "deny"]
+    assert "approval needed" in output(app)
+
+    def interrupted(text: str) -> str:
+        raise EOFError
+
+    monkeypatch.setattr(app, "_ask", interrupted)
+    assert app._prompt_approval(request) == "deny"
+
+
+def test_approval_falls_back_to_stdin_without_a_prompt_session(tmp_path, monkeypatch):
+    # Piped input and the window before the first prompt have no live editor, so
+    # the question goes through Rich's input() instead.
+    app = make_app(tmp_path)
+    monkeypatch.setattr(app.console, "input", lambda *args, **kwargs: "a")
+    request = PermissionRequest(tool_name="bash", kind="shell", subject="echo hi")
+    assert app._approval_from_stdin(request) == "session"
+    assert "approval needed" in output(app)
+
+    def interrupted(*args: Any, **kwargs: Any) -> str:
+        raise EOFError
+
+    monkeypatch.setattr(app.console, "input", interrupted)
+    assert app._approval_from_stdin(request) == "deny"
+
+
+def test_run_exits_cleanly_when_the_prompt_returns_none(tmp_path):
+    # A programmatic app.exit() without a result (an extension key binding, say)
+    # hands None back to the loop instead of a line.
+    app = make_app(tmp_path, model=resolve_model("faux/test"))
+    app._input = FakePrompt(None)
+    assert app.run() == 0
+    assert "bye" in output(app)

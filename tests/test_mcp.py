@@ -502,7 +502,8 @@ def test_mcp_command_renders(tmp_path, faux_model):
     buffer = StringIO()
     console = Console(file=buffer, width=100)
     session_commands.mcp_servers(session, console)
-    assert "No MCP servers configured" in buffer.getvalue()
+    # Silence here used to make "no servers" indistinguishable from a broken command.
+    assert "No MCP servers connected" in buffer.getvalue()
 
 
 def test_session_enables_configured_server_and_describes_it_in_prompt(tmp_path, faux_model):

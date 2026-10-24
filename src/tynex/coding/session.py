@@ -230,40 +230,6 @@ class SessionManager:
         path.reverse()
         return path
 
-    def create_branched_session(self, leaf_id: str) -> str | None:
-        """Copy the root→``leaf_id`` path into a new session."""
-        path = self.path_to(leaf_id)
-        if not path:
-            raise ValueError(f"Entry {leaf_id} not found")
-        new_id = _new_id()
-        data: dict[str, Any] = {"cwd": self.cwd, "version": 1}
-        if self.file_path:
-            data["parentSession"] = self.file_path
-        header = SessionEntry(id=new_id, parent_id=None, timestamp=_now_ms(), type="session", data=data)
-        rebuilt: list[SessionEntry] = [header]
-        parent = new_id
-        for entry in path:
-            if entry.type == "session":  # the old header; the new one replaces it
-                continue
-            rebuilt.append(
-                SessionEntry(
-                    id=entry.id, parent_id=parent, timestamp=entry.timestamp, type=entry.type, data=dict(entry.data)
-                )
-            )
-            parent = entry.id
-        if self.no_session or not self.file_path:
-            # In-memory mode: replace the current session contents in place.
-            self.entries = rebuilt
-            self.by_id = {entry.id: entry for entry in rebuilt}
-            self.current_leaf_id = rebuilt[-1].id
-            return None
-        stamp = time.strftime("%Y-%m-%dT%H-%M-%S")
-        new_file = self._session_dir() / f"{stamp}_tynex-{new_id}.jsonl"
-        with open(new_file, "w", encoding="utf-8", newline="\n") as fh:
-            for entry in rebuilt:
-                fh.write(json.dumps(entry.to_dict(), ensure_ascii=False) + "\n")
-        return str(new_file)
-
     def branch_messages(self) -> list[Message]:
         """The transcript the model sees, honoring the latest compaction."""
         path = [e for e in self.path_entries() if e.type in ("message", "compaction")]
@@ -311,13 +277,6 @@ class SessionManager:
             return self.by_id[prefix]
         matches = [e for e in self.entries if e.id.startswith(prefix)]
         return matches[0] if len(matches) == 1 else None
-
-    def branch_to(self, entry_id: str) -> SessionEntry | None:
-        entry = self.find_entry(entry_id)
-        if entry is None:
-            return None
-        self.current_leaf_id = entry.id
-        return entry
 
     def thinking_level(self) -> str | None:
         """The newest thinking-level change on the branch (audit record)."""

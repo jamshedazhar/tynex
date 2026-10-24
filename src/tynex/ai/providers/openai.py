@@ -10,6 +10,7 @@ from tynex.ai.providers.base import (
     LlmContext,
     Provider,
     StreamOptions,
+    clamp_thinking,
     finish_chunks,
     raise_for_status,
     tool_declarations,
@@ -84,6 +85,14 @@ class OpenAICompatProvider(Provider):
     def _supports_reasoning_effort(self, model: Model) -> bool:
         return model.provider == "openai"
 
+    def _reasoning_effort(self, model: Model, thinking: str | None) -> str | None:
+        """The ``reasoning_effort`` value for this model, if it takes one."""
+        if model.thinking_levels:
+            return "none" if not thinking or thinking == "off" else clamp_thinking(thinking, model.thinking_levels)
+        if not model.reasoning or not self._supports_reasoning_effort(model):
+            return None
+        return REASONING_EFFORT.get(thinking or "")
+
     def _chat_body(self, model: Model, context: LlmContext, options: StreamOptions) -> dict[str, Any]:
         body: dict[str, Any] = {"model": model.id, "messages": self._convert_messages(context), "stream": True}
         tools = self._convert_tools(context)
@@ -98,8 +107,8 @@ class OpenAICompatProvider(Provider):
         body["stream_options"] = {"include_usage": True}
         if options.temperature is not None and self._allows_temperature(model):
             body["temperature"] = options.temperature
-        effort = REASONING_EFFORT.get(options.thinking)
-        if effort and model.reasoning and self._supports_reasoning_effort(model):
+        effort = self._reasoning_effort(model, options.thinking)
+        if effort:
             body["reasoning_effort"] = effort
         return body
 

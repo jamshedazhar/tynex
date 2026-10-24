@@ -111,9 +111,6 @@ class CheckpointStore:
     def _snapshot_dir(self, group_id: int) -> Path:
         return self.root / f"{group_id:04d}" / "files"
 
-    def _absolute(self, relative: str) -> Path:
-        return Path(self.cwd, *relative.split("/"))
-
     # -- capturing ----------------------------------------------------------
     def capture(self, tool_name: str, paths: list[str]) -> CheckpointGroup | None:
         """Snapshot ``paths`` before a tool runs. Never raises."""
@@ -163,9 +160,15 @@ class CheckpointStore:
             return []
         restored: list[CheckpointGroup] = []
         for group in reversed(pending[-max(1, count) :]):
+            failed = False
             try:
                 for entry in group.files:
-                    absolute = self._absolute(entry.path)
+                    try:
+                        absolute = Path(resolve_path(entry.path, self.cwd))
+                    except (WorkspaceBoundaryError, ValueError):
+                        self.warnings.append(f"undo skipped an unsafe path in group #{group.id}: {entry.path!r}")
+                        failed = True
+                        continue
                     snapshot = self._snapshot_dir(group.id) / Path(*entry.path.split("/"))
                     if entry.action == "created":
                         if absolute.exists():
@@ -175,6 +178,9 @@ class CheckpointStore:
                         shutil.copy2(snapshot, absolute)
             except OSError as exc:
                 self.warnings.append(f"undo failed for group #{group.id}: {exc}")
+                failed = True
+            if failed:
+                continue
             group.undone = True
             self._write_manifest(group)
             shutil.rmtree(self._snapshot_dir(group.id), ignore_errors=True)

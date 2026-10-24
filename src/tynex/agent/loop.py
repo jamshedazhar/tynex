@@ -266,7 +266,7 @@ def _execute_tool_calls(
         _emit_ready(message, sink)
         finalized_calls.append(finalized)
         messages.append(message)
-    terminate = bool(finalized_calls) and all(f["result"].terminate for f in finalized_calls)
+    terminate = any(f["result"].terminate for f in finalized_calls)
     return {"messages": messages, "terminate": terminate}
 
 

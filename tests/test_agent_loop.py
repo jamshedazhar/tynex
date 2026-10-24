@@ -142,6 +142,38 @@ def test_loop_length_stop_skips_tool_execution(tmp_path, faux_model):
     assert "output token limit" in result.content[0].text
 
 
+def test_loop_terminate_from_a_blocked_call_ends_the_turn(tmp_path, faux_model):
+    """One terminable call ends the batch turn even if another call runs."""
+    (tmp_path / "a.txt").write_text("hello", encoding="utf-8")
+    faux.reset_script(
+        [
+            faux_scenario(
+                [
+                    {"type": "toolcall", "id": "t1", "name": "read", "arguments": {"path": "a.txt"}},
+                    {"type": "toolcall", "id": "t2", "name": "read", "arguments": {"path": "a.txt"}},
+                    {"type": "stop", "reason": "toolUse"},
+                ]
+            )
+        ]
+    )
+    tools = create_tools(str(tmp_path))
+
+    def before_tool_call(payload, signal):
+        if payload["toolCall"].id == "t1":
+            return {"block": True, "terminate": True, "reason": "stop after this call"}
+        return None
+
+    config = make_config(faux_model, tools, before_tool_call=before_tool_call)
+    context = AgentContext(messages=[], tools=tools)
+    new_messages = run_agent_loop([UserMessage(content="go")], context, config)
+
+    # Both calls are answered, but the loop does not ask the model again.
+    assert [message.role for message in new_messages] == ["user", "assistant", "toolResult", "toolResult"]
+    results = [message for message in new_messages if isinstance(message, ToolResultMessage)]
+    assert results[0].is_error and "stop after this call" in results[0].text()
+    assert not results[1].is_error
+
+
 def test_loop_provider_error_ends_turn(faux_model):
     faux.reset_script([faux_scenario([{"type": "error", "error": "boom"}])])
     tools = create_tools(".")

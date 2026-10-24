@@ -21,8 +21,8 @@ from tynex.ai.models import (
 from tynex.coding.settings import models_cache_path, resolve_api_key
 
 CACHE_TTL_SECONDS = 24 * 60 * 60
-# v2: Google catalogs record the model's ``thinking`` capability as ``reasoning``.
-CACHE_VERSION = 2
+# v3: catalogs record the model's supported thinking levels (``thinkingLevels``),
+CACHE_VERSION = 3
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
 
 

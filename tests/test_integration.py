@@ -9,9 +9,10 @@ from tests.conftest import PROVIDER_KEY_ENVS, faux_scenario, models_cache_payloa
 from tynex.ai import providers
 from tynex.ai.models import Model, register_models, resolve_model
 from tynex.ai.providers import faux
-from tynex.ai.types import AssistantMessage, TextContent, ToolCall, ToolResultMessage, UserMessage
+from tynex.ai.types import AssistantMessage, TextContent, ToolCall, ToolResultMessage, Usage, UserMessage
 from tynex.cli import run_json, run_print, serialize_event
-from tynex.coding.agent_session import AgentSession, compact
+from tynex.coding.agent_session import AgentSession
+from tynex.coding.compaction import compact
 from tynex.coding.session import SessionManager
 from tynex.coding.settings import save_auth
 from tynex.coding.system_prompt import load_context_files
@@ -133,6 +134,51 @@ def test_read_only_tool_selection_rules(tmp_path, faux_model):
     prompt = session.system_prompt_text()
     assert "- grep:" in prompt
     assert "for file operations" not in prompt
+
+
+# ---------------------------------------------------------------------------
+# Context estimation
+# ---------------------------------------------------------------------------
+
+
+def _usage_session(tmp_path, faux_model, usage: Usage) -> AgentSession:
+    session = AgentSession(cwd=str(tmp_path), model=faux_model, tool_names=["read"], no_session=True)
+    session.context.messages = [
+        UserMessage(content="hi"),
+        AssistantMessage(content=[TextContent(text="ok")], usage=usage),
+    ]
+    return session
+
+
+def test_estimate_context_tokens_counts_cache_writes(tmp_path, faux_model):
+    # Anthropic reports the prompt prefix under cache_creation_input_tokens and
+    # keeps usage.input free of it, so a cache-miss turn must still see ~30k.
+    session = _usage_session(tmp_path, faux_model, Usage(input=100, output=50, cache_write=30_000))
+    assert session.estimate_context_tokens() >= 30_150
+
+
+def test_estimate_context_tokens_counts_cache_reads(tmp_path, faux_model):
+    session = _usage_session(tmp_path, faux_model, Usage(input=100, output=50, cache_read=30_000))
+    assert session.estimate_context_tokens() >= 30_150
+
+
+def test_estimate_context_tokens_does_not_double_count_system_prompt(tmp_path, faux_model):
+    # usage.input already contains the system prompt and tool schemas.
+    session = _usage_session(tmp_path, faux_model, Usage(input=10_000, output=200))
+    assert session.estimate_context_tokens() == 10_200
+
+
+def test_estimate_context_tokens_falls_back_to_total_tokens(tmp_path, faux_model):
+    session = _usage_session(tmp_path, faux_model, Usage(output=200, total_tokens=20_000))
+    assert session.estimate_context_tokens() == 20_000
+
+
+def test_estimate_context_tokens_without_usage_uses_heuristic(tmp_path, faux_model):
+    session = AgentSession(cwd=str(tmp_path), model=faux_model, tool_names=["read"], no_session=True)
+    session.context.messages = [UserMessage(content="x" * 40_000)]
+    estimate = session.estimate_context_tokens()
+    assert estimate >= 10_000  # 40k chars at ~4 chars per token, plus the system prompt
+    assert estimate < len(session.system_prompt_text()) // 4 + 11_000
 
 
 # ---------------------------------------------------------------------------
@@ -441,30 +487,25 @@ def test_interactive_login_copilot_switches_off_unusable_model(tmp_path, monkeyp
 
 
 def test_interactive_typed_message_is_not_echoed_twice(tmp_path, faux_model):
-    from io import StringIO
-
-    from rich.console import Console
 
     def make_app():
         session = AgentSession(cwd=str(tmp_path), model=faux_model, tool_names=["read"], no_session=True)
-        buffer = StringIO()
-        console = Console(file=buffer, force_terminal=False, width=100)
-        return InteractiveApp(session, console=console), buffer
+        return InteractiveApp(session)
 
     # Input typed at the prompt is already on screen, so the renderer stays quiet.
     faux.reset_script([text_scenario("done")])
-    app, buffer = make_app()
+    app = make_app()
     app._handle_line("typed message", echo_user=False)
     app._run_thread.join(10)
-    assert "typed message" not in buffer.getvalue()
-    assert "done" in buffer.getvalue()
+    assert "typed message" not in app.transcript.text()
+    assert "done" in app.transcript.text()
 
     # Messages passed on the CLI were never displayed, so they are echoed once.
     faux.reset_script([text_scenario("done")])
-    app, buffer = make_app()
+    app = make_app()
     app._handle_line("cli message")
     app._run_thread.join(10)
-    assert buffer.getvalue().count("cli message") == 1
+    assert app.transcript.text().count("cli message") == 1
 
 
 def test_run_interactive_reports_missing_terminal(tmp_path, faux_model, monkeypatch):
@@ -524,6 +565,28 @@ def test_cli_print_mode(tmp_path):
     assert result.stdout.strip() == "scripted answer"
 
 
+def test_cli_plan_mode_prints_the_plan(tmp_path):
+    plan = "## Goal\nShip the plan gate."
+    script = [
+        faux_scenario(
+            [
+                {"type": "toolcall", "id": "call_1", "name": "submit_plan", "arguments": {"plan": plan}},
+                {"type": "stop", "reason": "toolUse"},
+            ]
+        )
+    ]
+    result = run_cli(tmp_path, ["-p", "--plan", "--model", "faux/test", "plan it"], script=script)
+    assert result.returncode == 0, result.stderr
+    assert plan in result.stdout
+    assert "tynex -c --permission-mode accept-edits" in result.stderr
+
+
+def test_cli_plan_conflicts_with_an_explicit_mode(tmp_path):
+    result = run_cli(tmp_path, ["-p", "--plan", "--permission-mode", "ask", "--model", "faux/test", "hi"])
+    assert result.returncode == 2
+    assert "--plan selects plan mode" in result.stderr
+
+
 def test_cli_continue_restores_session_model(tmp_path):
     first = run_cli(tmp_path, ["-p", "--model", "faux/test", "say hi"], script=[text_scenario("first answer")])
     assert first.returncode == 0, first.stderr
@@ -542,43 +605,6 @@ def test_cli_json_mode(tmp_path):
     events = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
     assert events[0]["type"] == "agent_start"
     assert events[-1]["type"] == "agent_end"
-
-
-def test_cli_rpc_mode(tmp_path):
-    script = [
-        faux_scenario(
-            [
-                {
-                    "type": "toolcall",
-                    "id": "call_1",
-                    "name": "write",
-                    "arguments": {"path": "rpc.txt", "content": "from rpc"},
-                },
-                {"type": "stop", "reason": "toolUse"},
-            ]
-        ),
-        text_scenario("rpc done"),
-    ]
-    stdin_text = (
-        json.dumps({"id": "1", "type": "prompt", "message": "write rpc.txt"})
-        + "\n"
-        + json.dumps({"id": "2", "type": "get_state"})
-        + "\n"
-        + json.dumps({"id": "3", "type": "shutdown"})
-        + "\n"
-    )
-    result = run_cli(tmp_path, ["--rpc", "--model", "faux/test"], stdin_text=stdin_text, script=script)
-    assert result.returncode == 0, result.stderr
-    payloads = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
-    assert payloads[0]["type"] == "ready"
-    responses = {p.get("id"): p for p in payloads if p["type"] == "response"}
-    assert responses["1"]["success"] is True
-    assert responses["2"]["success"] is True
-    assert responses["2"]["data"]["tools"]
-    assert (tmp_path / "rpc.txt").read_text(encoding="utf-8") == "from rpc"
-    event_types = [p["event"]["type"] for p in payloads if p["type"] == "event"]
-    assert "tool_execution_end" in event_types
-    assert event_types[-1] == "agent_end"
 
 
 def test_cli_models_and_sessions_subcommands(tmp_path):
@@ -723,24 +749,6 @@ def test_cli_invalid_budget_is_a_usage_error(tmp_path):
     assert "unknown budget field" in result.stderr
 
 
-def test_cli_rpc_undo_restores_files(tmp_path):
-    script = [call_scenario("write", {"path": "rpc.txt", "content": "from rpc"}), text_scenario("written")]
-    commands = [
-        {"id": "1", "type": "prompt", "message": "write rpc.txt"},
-        {"id": "2", "type": "set_permission_mode", "mode": "plan"},
-        {"id": "3", "type": "undo"},
-        {"id": "4", "type": "shutdown"},
-    ]
-    stdin_text = "\n".join(json.dumps(command) for command in commands) + "\n"
-    result = run_cli(tmp_path, ["--rpc", "--model", "faux/test"], stdin_text=stdin_text, script=script)
-    assert result.returncode == 0, result.stderr
-    payloads = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
-    responses = {payload.get("id"): payload for payload in payloads if payload["type"] == "response"}
-    assert responses["2"]["data"]["mode"] == "plan"
-    assert responses["3"]["data"]["undone"] == ["#1 write: rpc.txt"]
-    assert not (tmp_path / "rpc.txt").exists()
-
-
 def test_cli_warns_about_broken_mcp_servers_but_keeps_running(tmp_path):
     project = tmp_path / ".tynex"
     project.mkdir()
@@ -756,3 +764,29 @@ def test_cli_warns_about_broken_mcp_servers_but_keeps_running(tmp_path):
     quiet = run_cli(tmp_path, ["-p", "--model", "faux/test", "--no-mcp", "hi"], script=script)
     assert quiet.returncode == 0, quiet.stderr
     assert "MCP server" not in quiet.stderr
+
+
+def test_cli_accepts_permission_mode_after_the_prompt(tmp_path):
+    # A Click group stops parsing options at the first prompt word; the run
+    # flags must still apply when they follow it.
+    script = [call_scenario("write", {"path": "after.txt", "content": "x"}), text_scenario("planned")]
+    result = run_cli(tmp_path, ["-p", "--model", "faux/test", "plan it", "--permission-mode", "plan"], script=script)
+    assert result.returncode == 0, result.stderr
+    assert "planned" in result.stdout
+    assert not (tmp_path / "after.txt").exists()
+
+
+def test_cli_warns_when_thinking_is_unavailable(tmp_path):
+    # The session clamps to the model, so the flag must say it was not honoured.
+    result = run_cli(
+        tmp_path, ["-p", "--model", "faux/test", "--thinking", "high", "say hi"], script=[text_scenario("ok")]
+    )
+    assert result.returncode == 0, result.stderr
+    assert "needs a reasoning model" in result.stderr
+    assert "using 'off'" in result.stderr
+
+    result = run_cli(
+        tmp_path, ["-p", "--model", "faux/test", "--thinking", "off", "say hi"], script=[text_scenario("ok")]
+    )
+    assert result.returncode == 0, result.stderr
+    assert "needs a reasoning model" not in result.stderr

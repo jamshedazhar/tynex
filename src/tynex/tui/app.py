@@ -1,6 +1,7 @@
 """Interactive terminal UI: prompt loop, slash commands and session controls."""
 
 import contextlib
+import difflib
 import io
 import queue
 import sys
@@ -11,35 +12,26 @@ from dataclasses import dataclass, field
 from html import escape as html_escape
 from typing import Any
 
-from prompt_toolkit import PromptSession
-from prompt_toolkit.application.current import get_app_session
-from prompt_toolkit.application.run_in_terminal import run_in_terminal
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.history import FileHistory
-from prompt_toolkit.output import Output
 from rich.console import Console
+from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.text import Text
 
-from tynex.agent.permissions import PermissionRequest
+from tynex.agent.permissions import PermissionRequest, mode_description
 from tynex.ai.models import format_model
 from tynex.coding import session_commands, signin
 from tynex.coding.agent_session import AgentSession
 from tynex.coding.settings import input_history_path
 from tynex.coding.skills import expand_template
 from tynex.coding.tools.shell import shell_prompt
-from tynex.tui.prompt import (
-    ALIASES,
-    COMMANDS,
-    COMPLETION_MENU_ROWS,
-    PROMPT_STYLE,
-    TynexCompleter,
-    _cap_completion_menu,
-    _prompt_key_bindings,
-)
+from tynex.tui.docked import DockedPrompt
+from tynex.tui.prompt import ALIASES, COMMANDS, PROMPT_STYLE, TynexCompleter, _prompt_key_bindings
 from tynex.tui.renderer import Renderer, footer_text, running_text
 from tynex.tui.select import select_option
+from tynex.tui.transcript import Transcript
 
 try:  # prompt_toolkit's win32 module asserts the platform, so this works on Windows only
     from prompt_toolkit.output.win32 import NoConsoleScreenBufferError as _NoConsoleScreenBufferError
@@ -50,6 +42,19 @@ except Exception:  # pragma: no cover - non-Windows
 
 
 APPROVAL_SENTINEL = "\x00tynex:approval"  # returned by prompt() when an approval pulled it out
+APPROVAL_QUESTION = "allow? y=once · a=session · n=no → "
+PLAN_SENTINEL = "\x00tynex:plan"  # returned by prompt() when a submitted plan needs a decision
+PLAN_QUESTION = "execute this plan? y=execute · n=keep planning → "
+
+
+def _approval_outcome(answer: str) -> str:
+    """Map a typed approval answer to the permission gate's outcome."""
+    answer = answer.strip().lower()
+    if answer in ("y", "yes"):
+        return "allow"
+    if answer in ("a", "always", "s", "session"):
+        return "session"
+    return "deny"
 
 
 @dataclass
@@ -62,57 +67,72 @@ class _ApprovalEntry:
 
 
 class InteractiveApp:
-    def __init__(self, session: AgentSession, console: Console | None = None) -> None:
+    def __init__(self, session: AgentSession, console: Console | None = None, *, terminal: bool | None = None) -> None:
         self.session = session
-        self.console = console or Console()
-        # The prompt owns the terminal while a run streams, so the renderer
-        # prints completed sections above it instead of using a live region.
-        self.renderer = Renderer(session, self.console)
-        self._input: PromptSession | None = None
+        # Agent output and command output both become transcript blocks, so the
+        # user can scroll them and expand tool blocks (see tui/transcript.py).
+        self.transcript = Transcript()
+        self.console = console or Console(
+            file=_TranscriptWriter(self.transcript),
+            highlight=False,
+            force_terminal=bool(terminal),
+            # Logical lines stay whole: the transcript wraps them at its own
+            # width, so a terminal resize reflows instead of leaving hard breaks.
+            soft_wrap=True,
+        )
+        self.renderer = Renderer(session, self.transcript)
+        self.transcript.on_change = self._refresh
+        self._input: DockedPrompt | None = None
         # The agent runs in a background thread so the prompt stays usable.
         self._run_thread: threading.Thread | None = None
-        # Text put back into the editor by /fork.
+        # One run at a time: prompts submitted while a run is active wait here
+        # and are started by the finishing run. ``_run_finished`` closes the
+        # window where that thread is still alive but its work is over.
+        self._run_lock = threading.Lock()
+        self._queued_prompts: list[tuple[str, bool]] = []
+        self._run_finished = threading.Event()
+        self._run_finished.set()
+        self._closing = False
+        # A command line typed during a run, restored to the editor.
         self._prefill = ""
         # (used, window) tokens for the footer context meter; refreshed on turns.
         self._context: tuple[int, int] | None = None
         # Tool approvals requested by the agent thread, answered on the prompt thread.
         self._approvals: queue.Queue[_ApprovalEntry] = queue.Queue()
+        # Plans submitted for approval, answered the same way.
+        self._plans: queue.Queue[dict[str, Any]] = queue.Queue()
         session.permission_gate.on_ask = self._request_approval
 
     @property
-    def input(self) -> PromptSession:
-        """The prompt session, created lazily (needs a real console only when used)."""
+    def input(self) -> DockedPrompt:
+        """The docked prompt, created lazily (needs a real console only when used)."""
         if self._input is None:
-            _cap_completion_menu(COMPLETION_MENU_ROWS)
-            # NB: ``enable_history_search`` must stay off: prompt_toolkit's
-            # PromptSession turns ``complete_while_typing`` off while it is on,
-            # which leaves the completion menu empty (Up/Down still walk the
-            # history normally without it).
-            self._input = PromptSession(
+            # NB: ``enable_history_search`` must stay off: prompt_toolkit turns
+            # ``complete_while_typing`` off while it is on, which leaves the
+            # completion menu empty (Up/Down still walk the history normally).
+            self._input = DockedPrompt(
+                self.transcript,
                 history=FileHistory(str(input_history_path())),
                 style=PROMPT_STYLE,
                 completer=TynexCompleter(self.session),
-                complete_while_typing=True,
                 auto_suggest=AutoSuggestFromHistory(),
                 placeholder=[("class:placeholder", "Ask anything · /help · @files · !shell")],
-                multiline=True,
+                status=self._status,
+                toolbar=self._toolbar,
+                on_expand=self._expand_last_tool,
                 key_bindings=_prompt_key_bindings(interrupt=self._interrupt_run, is_busy=self._busy),
             )
         return self._input
 
     def _ask(self, text: str, *, password: bool = False) -> str:
-        """Ask one line of input.
+        """Ask one line of input (the docked prompt resets the mask itself)."""
+        return self.input.prompt(text, is_password=password)
 
-        ``PromptSession.prompt(is_password=True)`` turns the mask on for the
-        whole session and never clears it, so a masked question (an API key)
-        would leave every later prompt showing asterisks. Reset the flag once
-        the question is answered — also when it is cancelled.
-        """
-        prompt = self.input
-        try:
-            return prompt.prompt(text, is_password=password)
-        finally:
-            prompt.is_password = False
+    def _expand_last_tool(self) -> None:
+        block = self.transcript.last_tool()
+        if block is not None:
+            self.transcript.toggle(block)
+            self._refresh()
 
     def _select(self, title: str, options: list[str], *, selected: int = 0) -> int | None:
         if selected:
@@ -124,11 +144,14 @@ class InteractiveApp:
         stats = self.session.stats()
         session_label = stats["sessionId"][:8] if stats.get("sessionId") else "none"
         model_label = stats["model"] + (" — sign in with /login" if self.session.model is None else "")
+        mode = self.session.permission_gate.mode
+        plan_hint = " · /approve executes the plan" if mode == "plan" else ""
         self.console.print(
             f"\n[bold]Tynex[/] [dim]— minimal coding agent harness (Python)[/]\n"
             f"[dim]model [bold]{model_label}[/] · session {session_label} · cwd {self.session.cwd}[/]\n"
+            f"[dim]permissions [bold]{mode}[/] — {mode_description(mode)}{plan_hint} · /permissions to switch[/]\n"
             "[dim]Type /help for commands. Esc interrupts a run; messages typed while it runs are queued. "
-            "Ctrl+D exits.[/]\n"
+            "Ctrl+O expands a tool block. Ctrl+D exits.[/]\n"
         )
 
     def _toolbar(self) -> HTML:
@@ -136,10 +159,14 @@ class InteractiveApp:
         return HTML(f"<style fg='ansibrightblack'> {text} </style>")
 
     def _prompt(self) -> HTML:
+        return HTML("❯ ")  # noqa: RUF001 — intentional prompt glyph
+
+    def _status(self) -> HTML:
+        """The line above the input: what the run is doing, blank when idle."""
         if not self._busy():
-            return HTML("❯ ")  # noqa: RUF001 — intentional prompt glyph
+            return HTML("")
         status = html_escape(running_text(self.session, self.renderer.activity()), quote=False)
-        return HTML(f"<style fg='ansibrightblack'>{status}</style>\n❯ ")  # noqa: RUF001
+        return HTML(f"<style fg='ansibrightblack'>{status}</style>")
 
     def _title_text(self) -> str:
         return f"tynex · {format_model(self.session.model)}" if self.session.model is not None else "tynex"
@@ -171,6 +198,13 @@ class InteractiveApp:
                 self._context = (self.session.estimate_context_tokens(), model.context_window)
 
     # -- approvals ------------------------------------------------------------
+    def _return_to_prompt(self, sentinel: str) -> None:
+        """Hand control back to the prompt thread so it can ask the user something."""
+        app = getattr(self._input, "app", None) if self._input is not None else None
+        if app is not None and app.is_running:
+            with contextlib.suppress(Exception):
+                app.loop.call_soon_threadsafe(lambda live=app: live.exit(result=sentinel))
+
     def _request_approval(self, request: PermissionRequest) -> str:
         """Called from the agent thread; blocks until the prompt thread answers."""
         entry = _ApprovalEntry(request)
@@ -179,19 +213,50 @@ class InteractiveApp:
         while not entry.done.is_set():
             app = getattr(self._input, "app", None) if self._input is not None else None
             if app is not None and app.is_running:
-                with contextlib.suppress(Exception):
-                    app.loop.call_soon_threadsafe(lambda live=app: live.exit(result=APPROVAL_SENTINEL))
+                self._return_to_prompt(APPROVAL_SENTINEL)
                 break
             if time.monotonic() >= deadline:
                 # No live prompt (piped input, startup): answer it here.
                 try:
-                    entry.result = self._prompt_approval(request)
+                    entry.result = self._approval_from_stdin(request)
                 finally:
                     entry.done.set()
                 break
             time.sleep(0.05)
         entry.done.wait()
         return entry.result or "deny"
+
+    def _drain_plans(self) -> None:
+        """Print submitted plans and ask for a decision; prompt thread only."""
+        while True:
+            try:
+                event = self._plans.get_nowait()
+            except queue.Empty:
+                return
+            plan = str(event.get("plan") or "").strip()
+            pending = self.session.pending_plan
+            if not plan or pending is None or pending.get("id") != event.get("planId"):
+                continue  # stale: the plan was already approved or rejected
+            self.console.print(Panel(Markdown(plan), title="plan ready", border_style="green"))
+            if not self.console.is_terminal:
+                self.console.print("[dim]Plan recorded. Run /approve to accept it, or keep planning.[/]")
+                continue
+            try:
+                answer = self._ask(PLAN_QUESTION)
+            except (EOFError, KeyboardInterrupt):
+                answer = ""
+            try:
+                if answer.strip().lower() in ("y", "yes"):
+                    self.session.approve_plan()
+                    self.console.print("[green]Plan approved — switching to accept-edits.[/]")
+                    # The planning turn may still be finishing; ``_submit``
+                    # queues this until that run has released the session.
+                    self._submit("Execute the approved plan.")
+                else:
+                    self.session.reject_plan()
+                    self.console.print("[dim]Still in plan mode — keep refining, or send a new prompt.[/]")
+            except ValueError as exc:  # the decision was already recorded
+                self.console.print(f"[yellow]{exc}[/]")
 
     def _drain_approvals(self) -> None:
         """Answer every pending approval; runs on the prompt thread only."""
@@ -207,7 +272,7 @@ class InteractiveApp:
             finally:
                 entry.done.set()
 
-    def _prompt_approval(self, request: PermissionRequest) -> str:
+    def _print_approval(self, request: PermissionRequest) -> None:
         kind_label = {
             "shell": "shell command",
             "edit": "file change",
@@ -219,30 +284,36 @@ class InteractiveApp:
             lines.append(f"[dim]{html_escape(str(request.args)[:400])}[/]")
         lines.append(f"[dim]{kind_label}[/]")
         self.console.print(Panel("\n".join(lines), title="approval needed", border_style="yellow"))
+
+    def _prompt_approval(self, request: PermissionRequest) -> str:
+        """Ask on the input line, so y/a/n use the editor the user is already in."""
+        self._print_approval(request)
         try:
-            answer = (
-                self.console.input("[yellow]allow? [bold]y[/]=once · [bold]a[/]=session · [bold]n[/]=no[/] → ")
-                .strip()
-                .lower()
-            )
+            return _approval_outcome(self._ask(APPROVAL_QUESTION))
         except (EOFError, KeyboardInterrupt):
             return "deny"
-        if answer in ("y", "yes"):
-            return "allow"
-        if answer in ("a", "always", "s", "session"):
-            return "session"
-        return "deny"
+
+    def _approval_from_stdin(self, request: PermissionRequest) -> str:
+        """Ask without a prompt session: piped input, or before the first prompt."""
+        self._print_approval(request)
+        try:
+            return _approval_outcome(self.console.input(f"[yellow]{APPROVAL_QUESTION}[/]"))
+        except (EOFError, KeyboardInterrupt):
+            return "deny"
 
     # -- main loop --------------------------------------------------------------
     def _busy(self) -> bool:
         return self._run_thread is not None and self._run_thread.is_alive()
 
     def _refresh(self) -> None:
+        # Called from the agent thread too; ``invalidate`` is thread safe.
         app = getattr(self._input, "app", None) if self._input is not None else None
         if app is not None:
-            app.invalidate()
+            with contextlib.suppress(Exception):  # the loop may be closing
+                app.invalidate()
 
     def run(self, initial_message: str | None = None) -> int:
+        self._closing = False
         self._banner()
         message = (initial_message or "").strip()
         try:
@@ -254,26 +325,48 @@ class InteractiveApp:
             self._update_context()
             self.input  # noqa: B018 — create the session early so the title can be set
             self._sync_title()
+            self._refresh()
             while True:
                 self._drain_approvals()
+                self._drain_plans()
                 try:
-                    line = self.input.prompt(self._prompt, bottom_toolbar=self._toolbar, default=self._prefill)
+                    line = self.input.prompt(self._prompt(), default=self._prefill)
                 except KeyboardInterrupt:
                     continue
                 except EOFError:
                     break
+                if line is None:  # a programmatic exit without a result ends the loop
+                    break
                 self._prefill = ""
-                if line == APPROVAL_SENTINEL:
+                if line in (APPROVAL_SENTINEL, PLAN_SENTINEL):
                     continue
                 # The typed line is already on screen; don't render it again.
                 if line.strip() and self._handle_line(line.strip(), echo_user=False) is False:
                     break
         finally:
+            self._closing = True
             self._shutdown_run()
             self._drain_approvals()
+            self._drain_plans()
             self._set_title(None)
-            self.console.print("[dim]bye[/]")
+            self._print_bye()
         return 0
+
+    def _print_bye(self) -> None:
+        """Leave the exit message on the real terminal, not only in the transcript.
+
+        The console writes into the transcript, and a transcript change only
+        repaints while the prompt application is running. Nothing runs after
+        this point, so the transcript copy would never be drawn.
+        """
+        self.console.print("[dim]bye[/]")
+        app = getattr(self._input, "app", None) if self._input is not None else None
+        output = getattr(app, "output", None)
+        if output is None:
+            return
+        with contextlib.suppress(Exception):
+            output.write("bye\n")
+            output.flush()
 
     def _shutdown_run(self) -> None:
         thread = self._run_thread
@@ -328,6 +421,24 @@ class InteractiveApp:
         if self.session.model is None:
             self.console.print("[yellow]No model selected[/] — sign in with [bold]/login[/] or pick one with /model.")
             return
+        with self._run_lock:
+            if self._closing:
+                return
+            self._queued_prompts.append((text, echo_user))
+            self._start_next_run()
+
+    def _start_next_run(self) -> None:
+        """Start the next queued prompt; the caller holds ``_run_lock``."""
+        if self._closing:
+            self._queued_prompts.clear()
+            return
+        thread = self._run_thread
+        if thread is not None and thread.is_alive() and not self._run_finished.is_set():
+            return
+        if not self._queued_prompts:
+            return
+        text, echo_user = self._queued_prompts.pop(0)
+        self._run_finished.clear()
         self._run_thread = threading.Thread(
             target=self._run_prompt, args=(text,), kwargs={"echo_user": echo_user}, daemon=True
         )
@@ -343,7 +454,10 @@ class InteractiveApp:
             nonlocal last_refresh
             self.renderer.handle(event)
             kind = event.get("type")
-            if kind in ("agent_end", "compaction"):
+            if kind == "plan_ready":
+                self._plans.put(event)
+                self._return_to_prompt(PLAN_SENTINEL)
+            if kind in ("agent_end", "compaction", "plan_ready"):
                 self._update_context()
             now = time.monotonic()
             # Deltas only change the footer activity; throttle those repaints.
@@ -363,6 +477,9 @@ class InteractiveApp:
             self.renderer.echo_user = True
             self._sync_title()
             self._refresh()
+            with self._run_lock:
+                self._run_finished.set()
+                self._start_next_run()
 
     def _run_bash(self, command: str, *, exclude_from_context: bool = False) -> None:
         self.console.print(f"[bold green]{shell_prompt}[/] [bold]{command}[/]")
@@ -397,18 +514,17 @@ class InteractiveApp:
             "quit": lambda _arg: False,
             "model": self._cmd_model,
             "thinking": lambda a: session_commands.thinking(self.session, self.console, a, self._select),
-            "tree": lambda a: self._refresh_context(session_commands.tree(self.session, self.console, a)),
             "compact": lambda a: self._refresh_context(session_commands.compact(self.session, self.console, a)),
             "new": lambda _arg: self._refresh_context(session_commands.new_session(self.session, self.console)),
             "resume": lambda a: self._refresh_all(
                 session_commands.resume(self.session, self.console, a, self._ask, self._select)
             ),
-            "fork": self._fork,
-            "clone": lambda _arg: session_commands.clone(self.session, self.console),
             "export": lambda a: session_commands.export_session(self.session, self.console, a),
             "name": lambda a: session_commands.rename_session(self.session, self.console, a),
             "session": lambda _arg: session_commands.session_info(self.session, self.console),
             "permissions": lambda a: session_commands.permissions(self.session, self.console, a),
+            "plan": lambda _arg: self._enter_plan_mode(),
+            "approve": lambda _arg: self._approve_plan(),
             "budget": lambda _arg: session_commands.budget(self.session, self.console),
             "undo": lambda a: self._undo(a),
             "mcp": lambda _arg: session_commands.mcp_servers(self.session, self.console),
@@ -432,7 +548,10 @@ class InteractiveApp:
         template = self.session.prompt_templates.get(name)
         if template:
             return expand_template(template, arg)
-        self.console.print(f"[red]Unknown command /{name}. Try /help.[/]")
+        known = [*handlers, *(f"skill:{skill.name}" for skill in self.session.skills), *self.session.prompt_templates]
+        suggestion = difflib.get_close_matches(name, known, n=1, cutoff=0.6)
+        hint = f" Did you mean /{suggestion[0]}?" if suggestion else ""
+        self.console.print(f"[red]Unknown command /{name}.[/] Try /help.{hint}")
         return None
 
     def _refresh_context(self, _result: Any = None) -> None:
@@ -445,6 +564,25 @@ class InteractiveApp:
     def _undo(self, arg: str) -> None:
         session_commands.undo_session(self.session, self.console, arg)
         self._update_context()
+
+    def _enter_plan_mode(self) -> None:
+        if self.session.permission_gate.mode == "plan":
+            self.console.print("[dim]Already in plan mode — the agent submits a plan for /approve.[/]")
+            return
+        self.session.set_permission_mode("plan")
+        self.console.print(
+            "[green]Plan mode[/] — read-only. The agent investigates, then calls submit_plan; /approve executes it."
+        )
+        self._refresh_all()
+
+    def _approve_plan(self) -> None:
+        try:
+            self.session.approve_plan()
+        except ValueError as exc:
+            self.console.print(f"[yellow]{exc}[/]")
+            return
+        self.console.print("[green]Plan approved[/] — permission mode accept-edits. Send a message to execute it.")
+        self._refresh_all()
 
     def _list_models(self) -> None:
         session_commands.list_models(self.session, self.console)
@@ -461,12 +599,6 @@ class InteractiveApp:
 
     def _pick_model(self) -> None:
         session_commands.pick_model(self.session, self.console, self._select)
-        self._refresh_all()
-
-    def _fork(self, arg: str) -> None:
-        selected = session_commands.fork(self.session, self.console, arg, self._select)
-        if selected is not None:
-            self._prefill = selected
         self._refresh_all()
 
     def _login(self, arg: str) -> None:
@@ -497,6 +629,8 @@ class InteractiveApp:
         "@path              reference a file (paths complete while typing)",
         "Tab                complete /commands, /skill:<name> and @files",
         "Alt+Enter          insert a newline in the prompt",
+        "Ctrl+O             expand or collapse the last tool block",
+        "PgUp / PgDn        scroll the transcript (mouse wheel and clicks work too)",
         "Enter              with a menu open, fill in the row first; Enter again submits",
         "Esc                interrupt a run; messages typed while it runs are queued",
         "y / a / n          answer an approval request (once / allow this session / deny)",
@@ -531,53 +665,39 @@ class InteractiveApp:
             self.console.print(f"[dim]Extensions: {', '.join(self.session.loaded_extensions)}[/]")
 
 
-class _PromptWriter(io.TextIOBase):
-    """Write Rich output above the prompt from the UI or the agent thread."""
+class _TranscriptWriter(io.TextIOBase):
+    """Pipe Rich output (command output, panels, stray logs) into the transcript."""
 
-    def __init__(self) -> None:
-        self._session = get_app_session()
+    def __init__(self, transcript: Transcript) -> None:
+        self._transcript = transcript
 
     @property
     def encoding(self) -> str:  # Rich probes this when the console is built
-        return self._session.output.encoding()
-
-    def fileno(self) -> int:
-        return self._session.output.fileno()
+        return "utf-8"
 
     def isatty(self) -> bool:
-        return True
+        return False
 
     def write(self, text: str) -> int:
-        if text:
-            app = self._session.app
-            loop = app.loop if app is not None and app.is_running else None
-            if loop is None:
-                self._write(self._session.output, text)
-            else:
-                try:
-                    loop.call_soon_threadsafe(lambda: run_in_terminal(lambda: self._write(app.output, text)))
-                except RuntimeError:  # the loop closed between the check and the call
-                    self._write(self._session.output, text)
+        self._transcript.write(text)
         return len(text)
 
-    @staticmethod
-    def _write(output: Output, text: str) -> None:
-        output.write_raw(text)
-        output.flush()
+    def flush(self) -> None:
+        self._transcript.flush()
 
 
 def run_interactive(session: AgentSession, initial_message: str | None = None) -> int:
     try:
         if not sys.stdout.isatty():
             return InteractiveApp(session).run(initial_message)
-        writer = _PromptWriter()
+        app = InteractiveApp(session, terminal=True)
         # Keep stray prints (extension hooks, logging) from corrupting the prompt.
-        with contextlib.redirect_stderr(writer):
-            return InteractiveApp(session, console=Console(file=writer, highlight=False)).run(initial_message)
+        with contextlib.redirect_stderr(_TranscriptWriter(app.transcript)):
+            return app.run(initial_message)
     except _NoConsoleScreenBufferError:
         Console().print(
             "[red]Interactive mode needs a real terminal.[/] "
             'Use [bold]tynex -p "<prompt>"[/] for a one-shot run, '
-            "or [bold]tynex --json[/] / [bold]tynex --rpc[/] for scripting."
+            "or [bold]tynex --json[/] for scripting."
         )
         return 1

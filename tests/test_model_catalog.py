@@ -85,6 +85,60 @@ def test_fetch_models_openrouter_limits_and_pricing():
     assert models[0].cost.output == pytest.approx(15.0)
 
 
+def test_fetch_models_reads_deepseek_thinking_levels_and_limits():
+    # api.deepseek.com/models reports the effort levels thinking accepts, plus
+    # the real output limit and the accepted input modalities.
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(
+            200,
+            json={
+                "object": "list",
+                "data": [
+                    {
+                        "id": "deepseek-flash",
+                        "object": "model",
+                        "name": "DeepSeek-V4.1-Flash",
+                        "context_window": 1_048_576,
+                        "max_output_tokens": 393_216,
+                        "input_modalities": ["text", "image"],
+                        "effort": {"supported_levels": ["low", "high", "max"], "default_level": "high"},
+                    }
+                ],
+            },
+        )
+
+    spec = provider_spec("deepseek")
+    assert spec is not None
+    models = model_api.fetch_models(spec, "sk-ds", client=mock_client(handler))
+    assert len(models) == 1
+    model = models[0]
+    assert model.context_window == 1_048_576
+    assert model.max_tokens == 393_216
+    assert model.input == ("text", "image")
+    assert model.thinking_levels == ("low", "high", "max")
+    assert model.reasoning is True  # levels imply thinking support
+
+
+def test_fetch_models_reads_openrouter_reasoning_parameter():
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(
+            200,
+            json={
+                "data": [
+                    {"id": "vendor/thinker", "supported_parameters": ["tools", "reasoning"]},
+                    {"id": "vendor/plain", "supported_parameters": ["tools"]},
+                ]
+            },
+        )
+
+    spec = provider_spec("openrouter")
+    assert spec is not None
+    models = {m.id: m for m in model_api.fetch_models(spec, "sk-or", client=mock_client(handler))}
+    assert models["vendor/thinker"].reasoning is True
+    assert models["vendor/thinker"].thinking_levels == ()  # no levels reported
+    assert models["vendor/plain"].reasoning is False
+
+
 def test_fetch_models_anthropic_catalog():
     requests: list[httpx2.Request] = []
 

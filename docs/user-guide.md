@@ -3,10 +3,9 @@
 Tynex is a terminal coding agent implemented in Python. It can read and edit
 files, run commands, search the web, connect to MCP servers, and keep a
 resumable transcript of the work. The same agent loop powers the interactive
-terminal UI, the print/JSON/RPC modes, and the embedding SDK.
+terminal UI, the print and JSON modes, and the embedding SDK.
 
-This guide covers everyday CLI use. For the SDK API and package internals, see
-the project [README](../README.md).
+This guide covers everyday CLI use. For the SDK API and package internals, see the project [README](../README.md).
 
 ## Contents
 
@@ -112,7 +111,7 @@ subcommand; otherwise the whole line is the prompt.
 | --- | --- |
 | `-p`, `--print` | Run one prompt and print the final response. |
 | `--json` | Run one prompt and emit JSON events, one object per line. |
-| `--rpc` | Serve the line-delimited JSON RPC protocol over stdin/stdout. |
+| `--plan` | Start in plan mode: investigate, submit a plan, approve, then execute. |
 | `-c`, `-r`, `--resume [ID]` | Resume the latest session, or one matching `ID`. |
 | `-m`, `--model MODEL` | Select a model by `provider/model-id`, unique partial id, or glob. |
 | `--thinking LEVEL` | Set reasoning level: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. |
@@ -123,6 +122,11 @@ subcommand; otherwise the whole line is the prompt.
 | `--append-system-prompt TEXT` | Append text to the system prompt. |
 | `-v`, `--version` | Print the version and exit. |
 | `-h`, `--help` | Show help and exit. |
+
+Run options work before or after the prompt (`tynex "fix it" --permission-mode
+plan`); `--` ends the options so the rest is prompt text verbatim. A prompt word
+that merely looks like a flag (`tynex explain --tests`) stays prompt text unless
+it matches a run option.
 
 `-p` and `--json` can read the prompt from stdin when stdin is not a terminal:
 
@@ -204,59 +208,36 @@ tynex --json "review the diff" | jq -c 'select(.type == "message_end")'
 JSON mode runs one prompt and exits. Only JSON events are written to stdout;
 startup warnings such as MCP connection failures may appear on stderr.
 
-### RPC mode
+### Plan mode
 
 ```bash
-tynex --rpc
+tynex --plan "add retries to the HTTP client"
 ```
 
-RPC mode keeps one agent session alive and exchanges one JSON object per line
-over stdin/stdout. The first message announces the session:
+`/plan` switches an interactive session; the flag does the same for a run.
+Plan mode is a read-only approval policy: `read`, `grep`, `find`, `ls` and web
+requests run, while writes, edits, shell commands and MCP calls are denied.
+Instead of implementing, the agent calls `submit_plan` with the complete plan;
+that tool ends the turn so the plan is judged before any file changes.
 
-```json
-{"type":"ready","session":{"id":"<session-id>","file":"<path>","model":"provider/model-id","cwd":"<path>"}}
+Interactive runs print the plan and ask `execute this plan? y=execute ·
+n=keep planning`. Approving switches to `accept-edits`, records `plan_approved`,
+and starts execution. Declining records `plan_rejected` and stays in plan mode,
+so the next message revises it. `/approve` accepts a plan you did not answer at
+the prompt.
+
+Headless runs print the plan to stdout, exit `0`, and keep it in the session. When
+the same turn also emitted assistant text, only the plan is printed:
+
+```bash
+tynex -p --plan "add retries to the HTTP client"
+tynex -c --permission-mode accept-edits "execute the approved plan"
 ```
 
-Send a prompt with a request id:
-
-```json
-{"id":1,"type":"prompt","message":"list the Python files"}
-```
-
-While the prompt runs, the process emits events:
-
-```json
-{"type":"event","event":{"type":"message_end","message":{"role":"assistant","content":[]}}}
-```
-
-When the command finishes, it sends a response:
-
-```json
-{"type":"response","id":1,"command":"prompt","success":true,"data":{"state":{}}}
-```
-
-Supported command types:
-
-| Type | Main field | Purpose |
-| --- | --- | --- |
-| `prompt` | `message` | Run one prompt. |
-| `steer` | `message` | Queue a steering message during a run. |
-| `follow_up` | `message` | Queue a message for after the current run. |
-| `abort` | — | Abort the current run. |
-| `get_state` | — | Return session state and active tools. |
-| `get_messages` | — | Return the current conversation messages. |
-| `set_model` | `model` | Switch models by pattern. |
-| `compact` | `instructions` | Compact older messages. |
-| `new_session` | — | Start a fresh session. |
-| `list_sessions` | — | List sessions for the current directory. |
-| `resume_session` | `session` | Switch to a session by id prefix or path. |
-| `set_permission_mode` | `mode` | Change the approval policy. |
-| `undo` | `count` | Restore the last write/edit groups. |
-| `shutdown` | — | End the RPC process. |
-
-RPC mode requires a usable model before it starts, like print and JSON mode.
-Prompts are sent over stdin; an initial command-line prompt is not used in RPC
-mode.
+`submit_plan` is refused outside plan mode, and plan mode cannot be widened by
+`permissions.toml` rules — approving the plan is the only way out. The plan and
+the decision are session entries: resuming a session with an unreviewed plan
+restores it, so `/approve` still works after a restart.
 
 ## Built-in tools
 
@@ -269,6 +250,7 @@ The CLI exposes these tools by default:
 | `edit` | edit | Apply one or more exact text replacements to a file. |
 | `write` | edit | Create or overwrite a file. |
 | `websearch` | web | Search the web, or read one public URL. |
+| `submit_plan` | read | Submit the plan for approval and end the turn (plan mode only). |
 
 The shell tool's output is truncated to the last 2,000 lines or 50 KB,
 whichever comes first. If output is truncated, the full text is saved to a
@@ -295,11 +277,26 @@ as built-in tools.
 | `Esc` | Interrupt the current run. |
 | `Ctrl+C` | Interrupt the current run. |
 | `Ctrl+D` | Exit Tynex. |
-| `y` / `a` / `n` | Approve once / allow this tool for the session / deny. |
+| `Ctrl+O` | Expand or collapse the last tool block. |
+| `PgUp` / `PgDn`, mouse wheel | Scroll the transcript. |
+| Click a tool block | Expand or collapse its full input and output. |
+| `y` / `a` / `n` | Answer an approval question: once / this tool for the session / deny. |
 
 Messages typed while a turn is running are queued as steering. A queued
 `/command` or `!shell` line is returned to the editor instead of being sent to
 the model.
+
+### Output and tool blocks
+
+Answers, command output and tool calls live in a transcript above the input.
+A tool call takes one line while it is collapsed — what ran and a one-line
+result — and keeps the whole command, file change or result behind it. Click
+the block, or press `Ctrl+O` for the most recent one, to print the full input
+and output; the same keys collapse it again. Expansion only changes what is
+shown: nothing is re-run, and long output is not truncated while expanded.
+The transcript scrolls separately from the editor, so scrolling back never
+moves the cursor. Mouse reporting is on so blocks can be clicked; hold `Shift`
+while dragging to select text with the terminal's own selection.
 
 ### Commands
 
@@ -310,12 +307,11 @@ the model.
 | `/thinking [level]` | Set the thinking level; no argument opens a picker. |
 | `/new` | Start a new session. |
 | `/resume [id]` | Browse or switch sessions. |
-| `/tree [entry-id]` | Show the session tree; with an id, branch from that entry. |
-| `/fork [entry-id]` | Fork before a user message and put that message back in the editor. |
-| `/clone` | Duplicate the current session branch. |
 | `/export [path]` | Export the branch as JSONL for `.jsonl`, otherwise as static HTML. |
 | `/compact [notes]` | Compact older messages now, optionally with instructions. |
-| `/permissions [mode <mode>]` | Show or switch the approval policy. |
+| `/permissions [mode] <mode>` | Show or switch the approval policy. |
+| `/plan` | Switch to plan mode: investigate read-only, then submit a plan. |
+| `/approve` | Accept the pending plan and switch to `accept-edits`. |
 | `/budget` | Show token and cost usage against the configured limits. |
 | `/undo [count]` | Restore files changed by the last write/edit calls. |
 | `/mcp` | List connected MCP servers and their tools. |
@@ -361,10 +357,12 @@ In the TUI, an `ask` opens an approval panel:
 
 - `y` allows this call once.
 - `a` allows that tool for the rest of the session.
-- `n` denies it.
+- `n` (or `Esc`) denies it.
 
-Headless modes cannot prompt, so `ask` becomes a denial with a message that
-tells the model how to proceed.
+The startup banner and the footer both show the active mode, so a
+`--permission-mode` that did not take effect is visible immediately. Headless
+modes cannot prompt, so `ask` becomes a denial with a message that tells the
+model how to proceed.
 
 ### Permission rules
 
@@ -416,7 +414,8 @@ The effective mode is selected in this order:
 4. `accept-edits`.
 
 Use `/permissions` to inspect the current mode, rules, and session grants, and
-`/permissions mode ask` to switch during a session.
+`/permissions ask` to switch during a session (the word `mode` is optional:
+`/permissions mode ask` works too).
 
 ### Workspace guard
 
@@ -490,12 +489,8 @@ Use `--no-session` for a one-off run that should not create a session file:
 tynex -p --no-session "summarize this file"
 ```
 
-### Fork, clone, export, and tree
+### Export, labels, and plan decisions
 
-- `/fork [entry-id]` creates a new session before an earlier user message and
-  puts that message back in the editor.
-- `/clone` duplicates the current branch into a new session.
-- `/tree` shows the current branch; `/tree <entry-id>` branches from an entry.
 - `/export path.jsonl` writes the active branch as JSONL.
 - `/export path.html` (or any non-`.jsonl` path) writes a self-contained HTML
   transcript.
@@ -598,8 +593,7 @@ Startup selection order is:
 4. The newest sign-in in `auth.json`
 5. A provider environment variable
 
-If nothing is configured, interactive mode offers sign-in. Print, JSON, and
-RPC modes stop with an error.
+If nothing is configured, interactive mode offers sign-in. Print and JSON modes stop with an error.
 
 ### Thinking levels
 
@@ -608,10 +602,19 @@ tynex --thinking high
 tynex --thinking off
 ```
 
-Available levels are `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and
-`max`. A model may support only a subset; Tynex clamps the choice to the
-model's available levels. `/thinking` changes are stored in the session and in
-the global `settings.json`, so they survive a restart.
+The levels are `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`,
+but a model only accepts the ones its provider's catalog reports. DeepSeek, for
+example, lists `low`, `high`, and `max`; on that model `/thinking` offers
+exactly `off`, `low`, `high`, `max`, and asks for the nearest supported level
+when you name one it does not take (`/thinking medium` runs at `high` and says
+so). Tynex sends the level as `reasoning_effort` when the catalog lists levels,
+including `none` when thinking is `off`.
+
+Only reasoning models accept a level other than `off`: on a model without
+reasoning support, `--thinking high` prints a warning and runs at `off`, and
+`/thinking high` says the same with the fix (switch model with `/model`, or
+stay at `off`). `/thinking` changes are stored in the session and in the global
+`settings.json`, so they survive a restart.
 
 ### Custom OpenAI-compatible providers
 
@@ -629,7 +632,9 @@ Add a provider in `settings.json`:
           "id": "gpt-oss-120b",
           "name": "gpt-oss-120b",
           "contextWindow": 200000,
-          "maxTokens": 16384
+          "maxTokens": 16384,
+          "reasoning": true,
+          "thinkingLevels": ["low", "high"]
         }
       ]
     }
@@ -640,6 +645,10 @@ Add a provider in `settings.json`:
 The interactive `tynex login` custom-provider flow writes this shape for you.
 Use `apiKeyEnv` when the key should come from the environment instead of
 `auth.json`.
+
+A settings entry can also fill in what an endpoint does not report: `reasoning`
+turns thinking on, and `thinkingLevels` limits it to the levels the model takes.
+Both are read for fetched catalogs too, where they override the same model id.
 
 ### Web search
 
@@ -1011,7 +1020,7 @@ budgets, streaming, and MCP examples.
 
 ## Troubleshooting
 
-### “no model available” in print, JSON, or RPC mode
+### “no model available” in print or JSON mode
 
 Headless modes require a configured model before they start. Run
 `tynex login`, set a provider key, or pass `--model`:
@@ -1024,7 +1033,7 @@ Interactive mode can offer the sign-in menu instead of failing.
 
 ### Tool calls are denied in print mode
 
-Print, JSON, and RPC modes cannot show approval panels. An `ask` decision
+Print and JSON modes cannot show approval panels. An `ask` decision
 becomes a denial. Options:
 
 - Use `--permission-mode plan` for read-only work.

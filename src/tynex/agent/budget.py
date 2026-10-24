@@ -98,7 +98,10 @@ class BudgetState:
         self.started = None
 
     def add_usage(self, usage: Any) -> None:
-        self.tokens += int(getattr(usage, "total_tokens", 0) or 0) + int(getattr(usage, "cache_read", 0) or 0)
+        total = int(getattr(usage, "total_tokens", 0) or 0)
+        if not total:
+            total = int(getattr(usage, "input", 0) or 0) + int(getattr(usage, "output", 0) or 0)
+        self.tokens += total + int(getattr(usage, "cache_read", 0) or 0) + int(getattr(usage, "cache_write", 0) or 0)
         self.cost_usd += float(getattr(usage, "cost", 0.0) or 0.0)
 
     def exceeded(self, limits: BudgetLimits | None) -> str | None:

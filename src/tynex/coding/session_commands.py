@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from tynex.ai.models import format_model, format_tokens, providers
-from tynex.ai.providers.base import THINKING_LEVELS
+from tynex.ai.providers.base import THINKING_LEVELS, clamp_thinking
 from tynex.coding.model_catalog import ensure_models
 from tynex.coding.session import export_session_to_html, export_session_to_jsonl, find_session, list_sessions
 from tynex.coding.settings import remember_setting
@@ -84,25 +84,6 @@ def pick_model(session: "AgentSession", console: "Console", select: SelectFn) ->
         return
     session.set_model(chosen)
     console.print(f"[green]Switched to {format_model(chosen)}[/]")
-
-
-def tree(session: "AgentSession", console: "Console", arg: str) -> None:
-    if arg:
-        entry = session.session.branch_to(arg)
-        if entry is None:
-            console.print(f"[red]No unique entry matching '{arg}'[/]")
-            return
-        from tynex.agent.types import AgentContext
-
-        session.context = AgentContext(messages=session.session.branch_messages(), tools=session.tools)
-        console.print(f"[green]Branched to {entry.id}. The next message continues from here.[/]")
-        return
-    path = session.session.path_entries()
-    current = session.session.current_leaf_id
-    for index, entry in enumerate(path):
-        marker = "[green]●[/]" if entry.id == current else " "
-        console.print(f" {marker} [dim]{index:>3} {entry.id[:8]}[/] {entry.summary_line(70)}")
-    console.print("[dim]/tree <entry-id> to branch from an entry.\n[/]")
 
 
 def _resumed(session: "AgentSession", console: "Console", path: str) -> None:
@@ -190,6 +171,30 @@ def thinking(session: "AgentSession", console: "Console", arg: str, select: Sele
     set_thinking(session, console, available[index])
 
 
+def _explain_unavailable_thinking(session: "AgentSession", console: "Console", level: str) -> None:
+    """Explain why a level cannot be selected, and what to do about it.
+
+    "choose off" told the user nothing: the level is valid, the model just has no
+    reasoning mode, so the fix is a different model (or staying at off).
+    """
+    model = session.model
+    if model is None:
+        console.print(
+            f"[yellow]Thinking level '{level}' needs a reasoning model, and none is selected — "
+            "sign in with /login, or pick one with /model.[/]"
+        )
+    elif not model.reasoning:
+        console.print(
+            f"[yellow]Thinking level '{level}' needs a reasoning model — {format_model(model)} does not "
+            "support thinking. Use /model to switch, or /thinking off.[/]"
+        )
+    else:
+        console.print(
+            f"[yellow]Thinking level '{level}' is not available for {format_model(model)} "
+            f"(available: {', '.join(session.available_thinking_levels())}).[/]"
+        )
+
+
 def set_thinking(session: "AgentSession", console: "Console", level: str) -> None:
     requested = level.strip().lower()
     if requested not in THINKING_LEVELS:
@@ -197,10 +202,15 @@ def set_thinking(session: "AgentSession", console: "Console", level: str) -> Non
         return
     available = session.available_thinking_levels()
     if requested not in available:
+        if len(available) == 1:  # the model cannot think at all
+            _explain_unavailable_thinking(session, console, level.strip())
+            return
+        # The model reasons but the catalog lists other levels: use the nearest.
+        nearest = clamp_thinking(requested, available)
         console.print(
-            f"[yellow]Thinking level '{level}' is not available for this model (choose {', '.join(available)}).[/]"
+            f"[dim]{requested} is not offered by {format_model(session.model)}; "
+            f"using {nearest} ({', '.join(available)}).[/]"
         )
-        return
     try:
         applied = session.set_thinking(level)
     except ValueError as exc:
@@ -209,47 +219,6 @@ def set_thinking(session: "AgentSession", console: "Console", level: str) -> Non
     # Remember the choice in the global settings so new sessions start with it.
     remember_setting("thinking", applied)
     console.print(f"[green]Thinking level: {applied}[/]")
-
-
-def fork(session: "AgentSession", console: "Console", arg: str, select: SelectFn) -> str | None:
-    candidates = session.user_messages_for_forking()
-    if not candidates:
-        console.print("[yellow]No messages to fork from[/] — send a message first.")
-        return
-    if not arg:
-        if not console.is_terminal:
-            for index, (entry_id, text) in enumerate(candidates, 1):
-                console.print(f"  [bold]{index:>2}[/] [dim]{entry_id[:8]}[/] {short(text, 80)}")
-            console.print("[dim]/fork <entry-id> to start a new session before that user message.\n[/]")
-            return
-        options = [f"{short(text, 90)}  ({entry_id[:8]})" for entry_id, text in candidates]
-        index = _pick(select, "Fork before which user message?", options)
-        # ``_INTERRUPTED`` is -1: without this check an interrupted picker
-        # would silently fork before ``candidates[-1]``.
-        if index is _INTERRUPTED:
-            return None
-        if index is None:
-            console.print("[dim]Nothing to do.[/]")
-            return None
-        arg = candidates[index][0]
-    try:
-        new_file, selected = session.fork_session(arg)
-    except ValueError as exc:
-        console.print(f"[red]{exc}[/]")
-        return
-    name = Path(new_file).name if new_file else "in-memory session"
-    console.print(f"[green]Forked to new session {session.session.session_id[:8]} ({name})[/]")
-    console.print("[dim]The message was put back in the editor — edit and submit it to continue.[/]")
-    return selected
-
-
-def clone(session: "AgentSession", console: "Console") -> None:
-    if len(session.session.path_entries()) <= 1:
-        console.print("[yellow]Nothing to clone yet[/] — send a message first.")
-        return
-    new_file = session.clone_session()
-    name = Path(new_file).name if new_file else "in-memory session"
-    console.print(f"[green]Cloned to new session {session.session.session_id[:8]} ({name})[/]")
 
 
 def export_session(session: "AgentSession", console: "Console", arg: str) -> None:
@@ -293,16 +262,21 @@ def permissions(session: "AgentSession", console: "Console", arg: str) -> None:
     from tynex.agent.permissions import PERMISSION_MODES, mode_description
 
     arg = arg.strip()
+    value = ""
     if arg == "mode" or arg.startswith("mode "):
         _, _, value = arg.partition(" ")
         value = value.strip()
         if not value:
             console.print(f"[dim]usage: /permissions mode {'|'.join(PERMISSION_MODES)}[/]")
             return
+    elif arg:
+        value = arg
+    if value:
         try:
             applied = session.set_permission_mode(value)
         except ValueError as exc:
             console.print(f"[red]{exc}[/]")
+            console.print(f"[dim]usage: /permissions [mode] {'|'.join(PERMISSION_MODES)}[/]")
             return
         console.print(f"[green]Permission mode: {applied}[/] — {mode_description(applied)}")
         for warning in session.permission_config.warnings:
@@ -324,7 +298,7 @@ def permissions(session: "AgentSession", console: "Console", arg: str) -> None:
         console.print("[dim]Checkpoints are disabled (settings 'checkpoints': false).[/]")
     for warning in summary["warnings"]:
         console.print(f"[yellow]{warning}[/]")
-    console.print(f"[dim]/permissions mode {'|'.join(PERMISSION_MODES)} to switch.[/]")
+    console.print(f"[dim]/permissions {'|'.join(PERMISSION_MODES)} to switch ('mode' is optional).[/]")
 
 
 def budget(session: "AgentSession", console: "Console") -> None:
@@ -367,13 +341,13 @@ def undo_session(session: "AgentSession", console: "Console", arg: str) -> None:
 
 
 def mcp_servers(session: "AgentSession", console: "Console") -> None:
-    if session.mcp_manager is None:
+    summaries = session.mcp_manager.summaries() if session.mcp_manager is not None else []
+    if not summaries:
         console.print(
-            "[dim]No MCP servers configured — enable built-ins with[/] [bold]tynex mcp add memory[/][dim],[/]"
+            "[dim]No MCP servers connected — enable built-ins with[/] [bold]tynex mcp add memory[/][dim], "
+            "or add an 'mcpServers' entry to settings.json.[/]"
         )
-        console.print("[dim]or add an 'mcpServers' entry to settings.json.[/]")
-        return
-    for info in session.mcp_manager.summaries():
+    for info in summaries:
         if info["connected"]:
             tools = ", ".join(info["tools"]) or "no tools"
             console.print(f"  [green]●[/] [bold]{info['name']}[/] [dim]{info['transport']} · {info['server']}[/]")

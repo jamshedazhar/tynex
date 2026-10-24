@@ -86,6 +86,22 @@ class Chunk:
 THINKING_LEVELS: tuple[str, ...] = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
 
 
+def clamp_thinking(level: str, available: list[str] | tuple[str, ...]) -> str:
+    """The closest level ``available`` offers to ``level`` (higher on a tie)."""
+    levels = [candidate for candidate in available if candidate in THINKING_LEVELS]
+    if not levels:
+        return "off"
+    if level in levels:
+        return level
+    if level not in THINKING_LEVELS:
+        return levels[0]
+    target = THINKING_LEVELS.index(level)
+    return min(
+        levels,
+        key=lambda candidate: (abs(THINKING_LEVELS.index(candidate) - target), -THINKING_LEVELS.index(candidate)),
+    )
+
+
 def thinking_budget(level: str) -> int | None:
     """Anthropic/Google thinking budget per level (None = thinking off)."""
     return {"minimal": 1024, "low": 4096, "medium": 8192, "high": 16384, "xhigh": 24576, "max": 32000}.get(level)

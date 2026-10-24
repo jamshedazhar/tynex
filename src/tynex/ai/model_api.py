@@ -128,9 +128,21 @@ def _parse_openai(payload: Any) -> list[dict[str, Any]]:
         context = item.get("context_length") or item.get("context_window")
         if isinstance(context, (int, float)) and context > 0:
             entry["contextWindow"] = int(context)
-        output = item.get("max_completion_tokens") or item.get("max_tokens")
+        output = item.get("max_completion_tokens") or item.get("max_output_tokens") or item.get("max_tokens")
         if isinstance(output, (int, float)) and output > 0:
             entry["maxTokens"] = int(output)
+        modalities = item.get("input_modalities")
+        if isinstance(modalities, list) and modalities:
+            entry["input"] = [str(part) for part in modalities if isinstance(part, str)]
+        effort = item.get("effort")
+        levels = effort.get("supported_levels") if isinstance(effort, dict) else None
+        if isinstance(levels, list):
+            supported = [str(level).strip().lower() for level in levels if isinstance(level, str) and level.strip()]
+            if supported:
+                entry["thinkingLevels"] = supported
+        parameters = item.get("supported_parameters")
+        if isinstance(parameters, list) and "reasoning" in parameters:
+            entry["reasoning"] = True
         created = item.get("created")
         if isinstance(created, (int, float)):
             entry["created"] = float(created)
