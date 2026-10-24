@@ -28,6 +28,7 @@ class Model:
     context_window: int = DEFAULT_CONTEXT_WINDOW
     max_tokens: int = DEFAULT_MAX_TOKENS
     reasoning: bool = False
+    thinking_levels: tuple[str, ...] = ()
     input: tuple[str, ...] = ("text",)
     cost: Pricing = field(default_factory=Pricing)
     base_url: str | None = None
@@ -210,6 +211,12 @@ def model_from_spec(
     raw_cost = spec.get("cost")
     cost = raw_cost if isinstance(raw_cost, dict) else {}
     context, output = spec.get("contextWindow"), spec.get("maxTokens")
+    raw_levels = spec.get("thinkingLevels")
+    levels = (
+        tuple(str(level).strip().lower() for level in raw_levels if isinstance(level, str) and level.strip())
+        if isinstance(raw_levels, (list, tuple))
+        else ()
+    )
     return Model(
         id=model_id,
         name=str(spec.get("name") or model_id),
@@ -217,7 +224,9 @@ def model_from_spec(
         api=api,
         context_window=int(context) if isinstance(context, (int, float)) and context > 0 else context_window,
         max_tokens=int(output) if isinstance(output, (int, float)) and output > 0 else max_tokens,
-        reasoning=bool(spec.get("reasoning", False)),
+        # A model that advertises thinking levels reasons, even without the flag.
+        reasoning=bool(spec.get("reasoning", False)) or bool(levels),
+        thinking_levels=levels,
         input=tuple(str(part) for part in raw_input)
         if isinstance(raw_input, (list, tuple)) and raw_input
         else ("text",),
@@ -236,6 +245,8 @@ def model_to_spec(model: Model) -> dict[str, Any]:
         "reasoning": model.reasoning,
         "input": list(model.input),
     }
+    if model.thinking_levels:
+        spec["thinkingLevels"] = list(model.thinking_levels)
     cost = model.cost
     if cost.input or cost.output or cost.cache_read or cost.cache_write:
         spec["cost"] = {
