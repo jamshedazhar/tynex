@@ -98,6 +98,24 @@ def test_rule_globs_and_double_star_fallback():
     assert gate.check(write, {"path": "src/app.py"}).action == "allow"
 
 
+def test_allow_rule_matches_the_subject_not_the_payload_text():
+    # A write's "content" is data, not a path: it must not satisfy a path rule.
+    rules = [PermissionRule(tool="write", match="*.md", action="allow")]
+    gate = PermissionGate("ask", rules)
+    write = WriteTool(".")
+    blocked = gate.check(write, {"path": "notes.txt", "content": "README.md"})
+    assert blocked.action == "deny" and blocked.origin == "denied"  # the rule did not match
+    allowed = gate.check(write, {"path": "README.md", "content": "notes.txt"})
+    assert allowed.action == "allow" and allowed.origin == "rule"
+
+    # A tool that reports no subject is matched on its identifying arguments.
+    stub = StubTool("lookup", "tool")
+    stub.permission_subject = lambda args: ""  # type: ignore[method-assign]
+    globbed = PermissionGate("ask", [PermissionRule(tool="lookup", match="*.json", action="allow")])
+    decision = globbed.check(stub, {"path": "data.json", "body": "ignore me"})
+    assert decision.action == "allow" and decision.origin == "rule"
+
+
 def test_rule_can_target_mcp_tools_by_name():
     rules = [PermissionRule(tool="mcp__github__*", action="deny")]
     gate = PermissionGate("bypass", rules)
