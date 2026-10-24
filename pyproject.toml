@@ -93,6 +93,7 @@ only-include = [
     "/LICENSE",
     "/NOTICE",
     "/README.md",
+    "/CHANGELOG.md",
     "/pyproject.toml",
 ]
 exclude = ["**/__pycache__", "**/*.py[cod]"]
