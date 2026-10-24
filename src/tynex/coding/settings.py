@@ -37,9 +37,11 @@ def load_auth() -> dict[str, Any]:
 
 
 def save_auth(auth: dict[str, Any]) -> None:
+    """Write auth.json owner-only: the credentials must never be group/world readable."""
     path = auth_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as fh:
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as fh:
         json.dump(auth, fh, indent=2)
     with contextlib.suppress(OSError):
         os.chmod(path, 0o600)

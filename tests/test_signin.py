@@ -1,7 +1,10 @@
 """Tests for the shared sign-in helpers: arrow-key selector and login menu."""
 
 import json
+import os
+import stat
 
+import pytest
 from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 
@@ -232,3 +235,14 @@ def test_add_custom_provider_validates_input(tynex_config, monkeypatch):
         )
         is None
     )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows does not report POSIX mode bits")
+def test_auth_file_is_owner_only(tmp_path, monkeypatch):
+    """Credentials on disk must not be readable by other local users."""
+    from tynex.coding.settings import auth_path, store_api_key
+
+    monkeypatch.setenv("TYNEX_CONFIG_DIR", str(tmp_path))
+    store_api_key("anthropic", "sk-test")
+    mode = stat.S_IMODE(os.stat(auth_path()).st_mode)
+    assert mode == 0o600
