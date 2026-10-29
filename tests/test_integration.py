@@ -398,15 +398,21 @@ def test_interactive_model_picker_switches_current_provider(tmp_path, monkeypatc
     calls: dict[str, object] = {}
 
     def fake_select(title: str, options: list[str], *, selected: int = 0) -> int:
+        if title == "Providers":
+            calls["providers"] = options
+            return 0  # keep the current provider
         calls.update(title=title, options=options, selected=selected)
         return 1  # switch to the second model of the current provider
 
     monkeypatch.setattr(interactive_module, "select_option", fake_select)
     app._handle_line("/model")
 
+    providers_shown = calls["providers"]
+    assert isinstance(providers_shown, list)
+    assert any("Anthropic (anthropic)" in option for option in providers_shown)
     options = calls["options"]
     assert isinstance(options, list)
-    assert calls["title"] == "Models — anthropic"
+    assert calls["title"] == "Models — Anthropic"
     assert calls["selected"] == 0  # highlights the active model
     assert "claude-sonnet-4-5" in options[0] and "← current" in options[0]
     assert session.model is not None and session.model.id == "claude-haiku-4-5"

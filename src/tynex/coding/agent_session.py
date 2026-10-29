@@ -39,7 +39,7 @@ from tynex.coding.checkpoints import CheckpointGroup, CheckpointStore
 from tynex.coding.compaction import CompactionResult, compact, estimate_message_tokens, estimate_tokens
 from tynex.coding.mcp_settings import McpServerConfig, resolve_mcp_servers
 from tynex.coding.mcp_tools import McpManager
-from tynex.coding.model_catalog import ensure_models, resolve_model_retry
+from tynex.coding.model_catalog import ensure_catalog, ensure_models, resolve_model_retry
 from tynex.coding.permissions import PermissionConfig, load_permission_config
 from tynex.coding.session import SessionManager
 from tynex.coding.settings import detect_configured_provider, find_files, load_settings, resolve_api_key
@@ -86,9 +86,10 @@ class AgentSession:
     ) -> None:
         self.cwd = os.path.abspath(cwd)
         self.settings = load_settings(self.cwd)
+        ensure_catalog(self.settings)
         register_copilot_provider(self.settings)
         # Model selection: explicit > last used in session > settings > the
-        # configured provider's catalog (fetched from its models API on demand).
+        # configured provider's catalog (fetched or cached on demand).
         # ``None`` when nothing is usable yet — the interactive mode then offers
         # sign-in, other modes refuse to run.
         self.session = SessionManager(self.cwd, session_file=session_file, no_session=no_session)

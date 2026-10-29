@@ -87,7 +87,8 @@ tynex -p "list the TODO comments"    # print the final response
 tynex --json "summarize main.py" > events.jsonl
 tynex -c                             # continue the latest session
 tynex -r <id-prefix>                 # resume a specific session
-tynex models [provider]              # provider catalogs
+tynex models                         # providers from the shared model catalog
+tynex models anthropic               # one provider's models, limits and pricing
 tynex sessions                       # sessions for this directory
 tynex --plan "add retries to the client"   # plan first, approve, then execute
 tynex --help                         # every flag and subcommand
@@ -255,17 +256,20 @@ conversation. Disable checkpoints with `"checkpoints": false` in
 
 ## Providers
 
+Provider names, credentials and pricing come from a shared upstream catalog:
+
 | Provider | Credentials |
 | --- | --- |
 | Anthropic | `ANTHROPIC_API_KEY` |
 | OpenAI | `OPENAI_API_KEY` |
-| Google | `GEMINI_API_KEY` |
+| Google | `GOOGLE_API_KEY` or `GEMINI_API_KEY` |
 | xAI, Groq, DeepSeek, Mistral, OpenRouter | `XAI_API_KEY`, `GROQ_API_KEY`, `DEEPSEEK_API_KEY`, `MISTRAL_API_KEY`, `OPENROUTER_API_KEY` |
+| Z.AI, MiniMax, Moonshot, Alibaba, … | the key named by `tynex models` |
 | Ollama | none (local) |
 | GitHub Copilot | `tynex login github-copilot`, or `GITHUB_COPILOT_TOKEN` |
 
-Every provider also accepts `settings.apiKeys`. Sign-in stores credentials in
-`~/.tynex/agent/auth.json`
+Every provider also accepts `settings.apiKeys`. Sign in by id (`tynex login zai`);
+credentials are stored in `~/.tynex/agent/auth.json`.
 
 ```bash
 tynex login                   # pick OAuth, API key, or custom provider
@@ -274,12 +278,12 @@ tynex login github-copilot    # device flow (asks for the GitHub host)
 tynex logout [provider]
 ```
 
-Tynex ships no hard-coded model names. Catalogs are fetched from each provider's
-models API, cached in `~/.tynex/agent/models.json`, refreshed after 24 hours, and
-fall back to the cache when the provider is unreachable. Model selection at
-startup is: `--model`, the model stored in a resumed session, `model` in
-`settings.json`, the newest sign-in in `auth.json`, then a provider environment
-variable.
+Tynex ships no hard-coded model names. The shared catalog is cached in
+`~/.tynex/agent/models.json`, refreshed after 24 hours, and reused when the
+service is unreachable. Ollama and LM Studio list their installed models from
+the local endpoint. Model selection at startup is: `--model`, the model stored
+in a resumed session, `model` in `settings.json`, the newest sign-in in
+`auth.json`, then a provider environment variable.
 
 Custom OpenAI-compatible providers can be registered through `tynex login` or
 manually:
@@ -394,7 +398,7 @@ uv run python examples/sdk_agent.py --budget cost=0.50 "tour this repository"
 | Command | Action |
 | --- | --- |
 | `/help` | show commands |
-| `/model [pattern]` | switch model; no argument opens a picker |
+| `/model [pattern]` | switch model; no argument opens the provider and model pickers |
 | `/thinking [level]` | set the thinking level |
 | `/new` | start a new session |
 | `/resume`, `/sessions [id]` | browse and switch sessions |

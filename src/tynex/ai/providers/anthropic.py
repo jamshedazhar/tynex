@@ -156,7 +156,7 @@ class AnthropicProvider(Provider):
         if not api_key:
             raise RuntimeError("No Anthropic API key. Set ANTHROPIC_API_KEY or run /login in tynex.")
         base_url = (options.base_url or model.base_url or provider_base_url("anthropic") or "").rstrip("/")
-        url = f"{base_url}/v1/messages"
+        url = f"{base_url}/messages" if base_url.endswith("/v1") else f"{base_url}/v1/messages"
         max_tokens = options.max_tokens or model.max_tokens
         body: dict[str, Any] = {
             "model": model.id,

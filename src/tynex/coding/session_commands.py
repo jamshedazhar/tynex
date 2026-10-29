@@ -5,9 +5,9 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from tynex.ai.models import format_model, format_tokens, providers
+from tynex.ai.models import format_model, format_model_details, format_tokens, provider_label, providers
 from tynex.ai.providers.base import THINKING_LEVELS, clamp_thinking
-from tynex.coding.model_catalog import ensure_models
+from tynex.coding.model_catalog import ensure_catalog, ensure_models
 from tynex.coding.session import export_session_to_html, export_session_to_jsonl, find_session, list_sessions
 from tynex.coding.settings import remember_setting
 from tynex.coding.skills import read_skill_instructions
@@ -49,37 +49,65 @@ def list_models(session: "AgentSession", console: "Console") -> None:
     console.print("[dim]/model <pattern> to switch.\n[/]")
 
 
-def pick_model(session: "AgentSession", console: "Console", select: SelectFn) -> None:
-    """List the current provider's models and switch with the arrow picker."""
+def provider_options(session: "AgentSession") -> tuple[list[str], list[str]]:
+    ensure_catalog(session.settings)
+    current = session.model.provider if session.model is not None else None
+    ordered = sorted(providers(), key=lambda provider: provider != current)
+    labels = [f"{'● ' if provider == current else '  '}{provider_label(provider)} ({provider})" for provider in ordered]
+    return labels, ordered
+
+
+def pick_provider(session: "AgentSession", console: "Console", select: SelectFn) -> str | None:
+    if not console.is_terminal:
+        return None
+    labels, ordered = provider_options(session)
+    current = session.model.provider if session.model is not None else None
+    index = _pick(select, "Providers", labels, ordered.index(current) if current in ordered else 0)
+    if index is None or index is _INTERRUPTED or not 0 <= index < len(ordered):
+        return None
+    return ordered[index]
+
+
+def pick_model(session: "AgentSession", console: "Console", select: SelectFn, provider: str | None = None) -> None:
+    """Pick a provider and one of its models."""
     model = session.model
-    if model is None:
-        return list_models(session, console)
-    models, note = ensure_models(model.provider, session.settings)
+    if provider is None:
+        if console.is_terminal:
+            provider = pick_provider(session, console, select)
+            if provider is None:
+                return
+        elif model is None:
+            return list_models(session, console)
+        else:
+            provider = model.provider
+    models, note = ensure_models(provider, session.settings)
     if not models:
-        console.print(
-            f"[yellow]No models available for {model.provider}[/] — {note or f'run /login {model.provider}'}."
-        )
+        console.print(f"[yellow]No models available for {provider}[/] — {note or f'run /login {provider}'}.")
         return
+    current_id = model.id if model is not None and model.provider == provider else None
     if not console.is_terminal:
         # Piped/one-shot runs: no arrow picker, just list the catalog.
         for entry in models:
-            marker = "[green]●[/]" if entry.id == model.id else " "
-            console.print(f"  {marker} {entry.id} [dim]({format_tokens(entry.context_window)} ctx)[/]")
+            marker = "[green]●[/]" if entry.id == current_id else " "
+            console.print(f"  {marker} {entry.id} [dim]({format_model_details(entry)})[/]")
         console.print("[dim]/model <id> to switch.\n[/]")
         return
     options = [
-        f"{entry.id} ({format_tokens(entry.context_window)} ctx)" + ("  ← current" if entry.id == model.id else "")
+        f"{entry.id}  —  {entry.name} · {format_model_details(entry)}"
+        + ("  ← current" if entry.id == current_id else "")
         for entry in models
     ]
-    start = next((index for index, entry in enumerate(models) if entry.id == model.id), 0)
-    index = _pick(select, f"Models — {model.provider}", options, start)
+    start = next((index for index, entry in enumerate(models) if entry.id == current_id), 0)
+    index = _pick(select, f"Models — {provider_label(provider)}", options, start)
     if index is _INTERRUPTED:
         return
     if index is None:
         console.print("[dim]Model unchanged.[/]")
         return
+    if not 0 <= index < len(models):
+        return
     chosen = models[index]
-    if chosen.id == model.id:
+    if current_id == chosen.id:
         console.print(f"[dim]{format_model(chosen)} is already active.[/]")
         return
     session.set_model(chosen)

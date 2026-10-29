@@ -60,37 +60,23 @@ def _prompt_key_bindings(
 
 
 class TynexCompleter(Completer):
-    """Complete commands/shortcuts with ``/`` or at line start, and paths with ``@`` or as plain words."""
+    """Complete commands after ``/`` and paths after ``@``."""
 
     def __init__(self, session: "AgentSession") -> None:
         self.session = session
 
     def get_completions(self, document: Document, complete_event) -> Iterable[Completion]:
         del complete_event
-        before = document.text_before_cursor
-        word = _word_before_cursor(before)
-        if not word:
-            return
+        word = _word_before_cursor(document.text_before_cursor)
         if word.startswith("/"):
-            # Slash words complete anywhere in the message (``/`` lists all).
             yield from self._command_completions(word[1:], consumed=len(word))
         elif word.startswith("@"):
-            # @ mentions: complete the path after the "@" (which stays put).
             yield from _path_completions(word[1:], self.session.cwd)
-        else:
-            # Keystroke completion: command/shortcut names at the start of a
-            # line; paths anywhere (two characters or more to avoid noise).
-            if before.rsplit("\n", 1)[-1].strip() == word:
-                yield from self._command_completions(word, consumed=len(word), loose=True)
-            if len(word) >= 2:
-                yield from _path_completions(word, self.session.cwd)
 
-    def _command_completions(self, prefix: str, *, consumed: int, loose: bool = False) -> Iterable[Completion]:
+    def _command_completions(self, prefix: str, *, consumed: int) -> Iterable[Completion]:
         prefix = prefix.lower()
         for name, help_text in _command_table(self.session).items():
-            lower = name.lower()
-            tail = lower.split(":", 1)[-1]
-            if lower.startswith(prefix) or (loose and tail.startswith(prefix)):
+            if name.lower().startswith(prefix):
                 yield Completion("/" + name, start_position=-consumed, display="/" + name, display_meta=help_text)
 
 
@@ -160,7 +146,7 @@ class Command(NamedTuple):
 
 COMMANDS: dict[str, Command] = {
     "help": Command("", "show commands and shortcuts"),
-    "model": Command("[pattern]", "switch model (no argument picks one from the current provider)"),
+    "model": Command("[pattern]", "switch model (no argument opens the provider and model pickers)"),
     "thinking": Command("[level]", "set the thinking level (no argument picks one)"),
     "compact": Command("[notes]", "summarize older messages now"),
     "new": Command("", "start a fresh session"),

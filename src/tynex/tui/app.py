@@ -456,7 +456,10 @@ class InteractiveApp:
             kind = event.get("type")
             if kind == "plan_ready":
                 self._plans.put(event)
-                self._return_to_prompt(PLAN_SENTINEL)
+                if self.console.is_terminal:
+                    self._return_to_prompt(PLAN_SENTINEL)
+                else:
+                    self._drain_plans()
             if kind in ("agent_end", "compaction", "plan_ready"):
                 self._update_context()
             now = time.monotonic()
@@ -626,7 +629,7 @@ class InteractiveApp:
         "!command           run a shell command (output joins the conversation)",
         "!!command          run a shell command (output stays out of the model context)",
         "/<template> [args] run a prompt template from .tynex/prompts/",
-        "@path              reference a file (paths complete while typing)",
+        "@path              reference a file (paths complete after @)",
         "Tab                complete /commands, /skill:<name> and @files",
         "Alt+Enter          insert a newline in the prompt",
         "Ctrl+O             expand or collapse the last tool block",

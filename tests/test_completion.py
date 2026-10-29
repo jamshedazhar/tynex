@@ -199,36 +199,22 @@ def test_at_mention_mid_line_and_at_alone(tmp_path):
     assert "README.md" in texts(completer, "@")  # bare "@" lists the directory
 
 
-def test_plain_words_complete_paths(tmp_path):
+def test_plain_words_do_not_open_a_menu(tmp_path):
     (tmp_path / "README.md").write_text("x", encoding="utf-8")
     src = tmp_path / "src"
     src.mkdir()
     (src / "main.py").write_text("x", encoding="utf-8")
 
     completer = make_completer(tmp_path)
-    assert texts(completer, "REA") == ["README.md"]
-    assert texts(completer, "src/ma") == ["main.py"]
-    assert texts(completer, "explain REA") == ["README.md"]
-    completion = next(iter(completer.get_completions(Document("src/ma"), None)))
-    assert apply_completion("src/ma", completion) == "src/main.py"
+    assert texts(completer, "REA") == []
+    assert texts(completer, "src/ma") == []
+    assert texts(completer, "explain REA") == []
 
 
-def test_plain_first_word_completes_commands_shortcuts_and_skills(tmp_path):
-    prompts = tmp_path / ".tynex" / "prompts"
-    prompts.mkdir(parents=True)
-    (prompts / "review.md").write_text("Review the diff.", encoding="utf-8")
-    write_skill(tmp_path)
+def test_plain_first_word_does_not_complete_commands(tmp_path):
     completer = make_completer(tmp_path)
-
-    assert "/help" in texts(completer, "he")
-    assert "/stats" in texts(completer, "stat")  # alias
-    assert "/review" in texts(completer, "rev")  # prompt template
-    assert "/skill:release" in texts(completer, "rel")  # skill suffix
-
-    completion = next(iter(completer.get_completions(Document("he"), None)))
-    assert apply_completion("he", completion) == "/help"
-
-    # A command word in the middle of prose stays prose (no menu hijacking Enter).
+    assert texts(completer, "he") == []
+    assert texts(completer, "stat") == []
     assert texts(completer, "please he") == []
 
 

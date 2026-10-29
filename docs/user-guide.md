@@ -83,8 +83,8 @@ tynex "summarize this repository and list the main modules"
 Useful first checks:
 
 ```bash
-tynex models                  # list models from every configured provider
-tynex models anthropic        # list one provider
+tynex models                  # providers from the shared catalog
+tynex models anthropic        # one provider's models, limits and pricing
 tynex --help                  # every run flag and subcommand
 tynex login --help
 tynex mcp --help
@@ -143,7 +143,7 @@ printf 'list the TODO comments\n' | tynex -p
 | `tynex mcp list` | Show built-in, configured, and available runtimes. |
 | `tynex mcp add NAME` | Enable a built-in server or add a custom MCP server. |
 | `tynex mcp remove NAME` | Remove an MCP entry from a settings file. |
-| `tynex models [provider]` | List provider model catalogs. |
+| `tynex models [provider]` | List providers, or one provider's models with limits and pricing. |
 | `tynex sessions` | List sessions for the current directory. |
 
 A prompt that begins with a subcommand name is dispatched as that command. For
@@ -303,7 +303,7 @@ while dragging to select text with the terminal's own selection.
 | Command | Action |
 | --- | --- |
 | `/help` | Show commands, shortcuts, aliases, skills, and templates. |
-| `/model [pattern]` | Switch model; no argument opens a picker for the current provider. |
+| `/model [pattern]` | Switch model; no argument opens the provider and model pickers. |
 | `/thinking [level]` | Set the thinking level; no argument opens a picker. |
 | `/new` | Start a new session. |
 | `/resume [id]` | Browse or switch sessions. |
@@ -525,17 +525,20 @@ reverted. Disable checkpoints globally or per project with:
 
 ## Models and providers
 
-Tynex ships no hard-coded model names. It fetches each provider's model catalog,
-caches it in `~/.tynex/agent/models.json`, refreshes it after 24 hours, and
-falls back to the cache when the provider is unreachable.
+Tynex ships no hard-coded model names. Provider and model details come from a
+shared catalog cached in `~/.tynex/agent/models.json`, refreshed after 24 hours,
+and reused when the service is unreachable. Ollama and LM Studio list installed
+models from the local endpoint.
 
-### Built-in providers
+### Providers
+
+Common providers:
 
 | Provider | Credentials |
 | --- | --- |
 | Anthropic | `ANTHROPIC_API_KEY` |
 | OpenAI | `OPENAI_API_KEY` |
-| Google | `GEMINI_API_KEY` or `GOOGLE_API_KEY` |
+| Google | `GOOGLE_API_KEY` or `GEMINI_API_KEY` |
 | xAI | `XAI_API_KEY` |
 | DeepSeek | `DEEPSEEK_API_KEY` |
 | Groq | `GROQ_API_KEY` |
@@ -545,7 +548,8 @@ falls back to the cache when the provider is unreachable.
 | LM Studio | none; local endpoint |
 | GitHub Copilot | `tynex login github-copilot`, or `GITHUB_COPILOT_TOKEN` |
 
-Every provider also accepts keys in `settings.apiKeys`. Key resolution order is:
+`tynex models` lists every provider and the key it needs; `tynex login <provider>`
+accepts those ids. Keys also come from `settings.apiKeys` or the environment:
 
 1. `settings.apiKeys[provider]`
 2. `~/.tynex/agent/auth.json` (written by `tynex login`)
@@ -868,7 +872,7 @@ with `TYNEX_CONFIG_DIR`.
 | `~/.tynex/agent/settings.json` | Global settings. |
 | `<project>/.tynex/settings.json` | Project settings, merged over global. |
 | `~/.tynex/agent/auth.json` | Credentials written by `tynex login`. |
-| `~/.tynex/agent/models.json` | Cached provider model catalogs. |
+| `~/.tynex/agent/models.json` | Cached shared catalog and local model lists. |
 | `~/.tynex/agent/permissions.toml` | Global permission rules. |
 | `<project>/.tynex/permissions.toml` | Project permission rules. |
 | `~/.tynex/agent/sessions/` | JSONL session files. |
@@ -1056,14 +1060,15 @@ be removed if you want servers to start.
 
 ### The model catalog is empty
 
-The provider may be unreachable and have no cached catalog yet. Check the API
-key, base URL, and network/proxy settings, then run:
+The shared catalog may be unreachable and have no cached copy yet. Check the
+network or proxy settings, then run:
 
 ```bash
 tynex models <provider>
 ```
 
-Ollama and LM Studio must have their local endpoints running.
+Ollama and LM Studio must have their local endpoints running. Their models come
+from the endpoint, not from the shared catalog.
 
 ### Web search falls back to Wikipedia
 

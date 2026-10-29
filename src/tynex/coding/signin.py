@@ -16,11 +16,12 @@ from tynex.ai.models import (
     default_model_for_provider,
     format_model,
     provider_api_key_env,
+    provider_label,
     providers,
     register_custom_providers,
 )
 from tynex.ai.providers import copilot as copilot_api
-from tynex.coding.model_catalog import ensure_models
+from tynex.coding.model_catalog import ensure_catalog, ensure_models
 from tynex.coding.settings import (
     load_auth,
     remove_credential,
@@ -42,7 +43,6 @@ NO_KEY_PROVIDERS = ("faux", "ollama", "lmstudio")
 # Providers that sign in with a browser device flow (OAuth-style).
 OAUTH_PROVIDERS = ("github-copilot",)
 
-_PROVIDER_LABELS = {"github-copilot": "GitHub Copilot"}
 _NAME_PATTERN = re.compile(r"[a-z0-9][a-z0-9_-]*")
 
 # ask(text, *, password=False) -> one line of input ("" to cancel).
@@ -52,11 +52,6 @@ SelectFn = Callable[..., "int | None"]
 # switch(provider) -> the model selected after sign-in, or None.
 SwitchFn = Callable[[str], "Model | None"]
 EchoFn = Callable[[str], None]
-
-
-def provider_label(provider: str) -> str:
-    """Human-readable provider name for pickers and messages."""
-    return _PROVIDER_LABELS.get(provider, provider)
 
 
 def oauth_providers() -> list[str]:
@@ -97,6 +92,7 @@ def interactive_login(
     *, ask: AskFn, select: SelectFn, echo: EchoFn, settings: dict[str, Any] | None = None
 ) -> str | None:
     """The ``tynex login`` menu: OAuth, API key or a custom OpenAI-compatible provider."""
+    ensure_catalog(settings)
     oauth = oauth_providers()
     oauth_label = "OAuth — " + ", ".join(provider_label(name) for name in oauth) if oauth else "OAuth"
     method = select("How do you want to sign in?", [oauth_label, "API key", "Add custom provider (OpenAI-compatible)"])
@@ -120,7 +116,9 @@ def interactive_login(
         return None
     if method == 1:
         choices = api_key_providers()
-        index = select("API key for which provider?", [f"{name}  —  {login_hint(name)}" for name in choices])
+        index = select(
+            "API key for which provider?", [f"{provider_label(name)}  —  {login_hint(name)}" for name in choices]
+        )
         if index is None:
             return None
         provider = choices[index]

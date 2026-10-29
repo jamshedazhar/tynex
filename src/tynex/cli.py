@@ -25,7 +25,10 @@ from tynex.agent.permissions import PERMISSION_MODES
 from tynex.ai.models import (
     default_model_for_provider,
     format_model,
+    format_model_details,
+    models_for_provider,
     provider_api_key_env,
+    provider_label,
     providers,
     register_custom_providers,
 )
@@ -33,13 +36,14 @@ from tynex.ai.providers.base import THINKING_LEVELS
 from tynex.ai.types import AssistantMessage, content_to_dict, message_to_dict
 from tynex.coding.agent_session import AgentSession
 from tynex.coding.mcp_settings import builtin_catalog, builtin_status, runtime_path
-from tynex.coding.model_catalog import ensure_models, resolve_model_retry
+from tynex.coding.model_catalog import ensure_catalog, ensure_models, resolve_model_retry
 from tynex.coding.session import find_session, latest_session_file, list_sessions
 from tynex.coding.settings import (
     load_settings,
     project_dir,
     read_settings_file,
     remove_credential,
+    resolve_api_key,
     settings_path,
     store_api_key,
     write_settings_file,
@@ -100,26 +104,34 @@ class CliError(click.ClickException):
 def _settings() -> dict[str, Any]:
     settings = load_settings(os.getcwd())
     register_custom_providers(settings.get("providers") or {})
+    ensure_catalog(settings)
     register_copilot_provider(settings)
     return settings
 
 
 def print_models(settings: dict[str, Any], provider: str | None = None) -> None:
-    names = providers()
-    if provider and provider not in names:
-        raise CliError(f"Unknown provider {provider!r}. Known providers: {', '.join(names)}")
-    for name in [provider] if provider else names:
-        models, note = ensure_models(name, settings)
-        click.echo(f"{name}:")
+    if provider:
+        ensure_catalog(settings)
+        if provider not in providers():
+            raise CliError(f"Unknown provider {provider!r}. Known providers: {', '.join(providers()[:12])}")
+        models, note = ensure_models(provider, settings)
+        click.echo(f"{provider}: {provider_label(provider)}")
         if not models:
-            click.echo(f"  ({note or f'no models — run `tynex login {name}`'})")
-            continue
+            click.echo(f"  ({note or f'no models — run `tynex login {provider}`'})")
+            return
         for model in models:
-            if model.thinking_levels:
-                flags = f" (thinking: {', '.join(model.thinking_levels)})"
-            else:
-                flags = " (reasoning)" if model.reasoning else ""
-            click.echo(f"  {format_model(model)}  — {model.name}, {model.context_window:,} ctx{flags}")
+            click.echo(f"  {format_model(model)}  — {model.name} · {format_model_details(model)}")
+        return
+    note = ensure_catalog(settings)
+    if note:
+        click.echo(f"({note})", err=True)
+    for name in providers():
+        models = models_for_provider(name)
+        count = f"{len(models)} models" if models else "no catalog"
+        envs = provider_api_key_env(name)
+        credential = "configured" if resolve_api_key(name, settings) else (envs[0] if envs else "no key")
+        click.echo(f"  {name}: {provider_label(name)} · {count} · {credential}")
+    click.echo("\n`tynex models <provider>` lists that provider's models with limits and pricing.")
 
 
 def print_sessions(cwd: str) -> None:
@@ -175,7 +187,10 @@ def login_command(provider: str | None) -> int:
 def _login_provider(provider: str, settings: dict[str, Any]) -> int:
     choices = providers()
     if provider not in choices:
-        raise CliError(f"Unknown provider {provider!r}. Known providers: {', '.join(choices)}")
+        ensure_catalog(settings)
+        choices = providers()
+    if provider not in choices:
+        raise CliError(f"Unknown provider {provider!r}. Known providers: {', '.join(choices[:12])}")
     if provider == "github-copilot":
         if not copilot_login(ask=_cli_ask, echo=click.echo, settings=settings):
             return 1
