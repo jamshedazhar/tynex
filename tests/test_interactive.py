@@ -1320,14 +1320,14 @@ def test_logout_removes_stored_credentials(tmp_path):
 
     app._handle_command("/logout anthropic")
     out = output(app)
-    assert "Removed stored API key for anthropic" in out
+    assert "Removed stored API key for Anthropic" in out
     assert set(load_auth()) == {"openai"}
 
     app._handle_command("/logout anthropic")
     assert "No stored credentials for anthropic" in output(app)
 
     app._handle_command("/logout")  # non-terminal: only one provider left
-    assert "Removed stored API key for openai" in output(app)
+    assert "Removed stored API key for OpenAI" in output(app)
     assert load_auth() == {}
 
     app._handle_command("/logout")
