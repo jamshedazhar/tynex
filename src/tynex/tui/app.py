@@ -626,7 +626,7 @@ class InteractiveApp:
         "!command           run a shell command (output joins the conversation)",
         "!!command          run a shell command (output stays out of the model context)",
         "/<template> [args] run a prompt template from .tynex/prompts/",
-        "@path              reference a file (paths complete while typing)",
+        "@path              reference a file (paths complete after @)",
         "Tab                complete /commands, /skill:<name> and @files",
         "Alt+Enter          insert a newline in the prompt",
         "Ctrl+O             expand or collapse the last tool block",
