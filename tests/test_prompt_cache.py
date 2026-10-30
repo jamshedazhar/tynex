@@ -24,6 +24,7 @@ def make_model() -> Model:
 
 def install_transport(captured: dict) -> None:
     def handler(request: httpx2.Request) -> httpx2.Response:
+        captured["url"] = str(request.url)
         captured["body"] = json.loads(request.content)
         events = [
             {"type": "message_start", "message": {"usage": {"input_tokens": 10}}},
@@ -70,6 +71,7 @@ def test_anthropic_requests_carry_cache_breakpoints(monkeypatch):
     events = list(provider.stream(make_model(), context, StreamOptions(api_key="test-key")))
     assert any(event.get("type") == "done" for event in events)
 
+    assert captured["url"].endswith("/v1/messages")
     body = captured["body"]
     # System prompt and the tool block prefix are cached
     assert body["system"] == [
@@ -83,6 +85,17 @@ def test_anthropic_requests_carry_cache_breakpoints(monkeypatch):
     for message in body["messages"][:-1]:
         assert all("cache_control" not in block for block in message["content"])
     assert count_breakpoints(body) == 3
+
+
+def test_anthropic_accepts_a_base_url_that_already_ends_in_v1():
+    captured: dict = {}
+    install_transport(captured)
+    model = make_model()
+    model.base_url = "https://api.minimax.io/anthropic/v1"
+    list(
+        AnthropicProvider().stream(model, LlmContext(messages=[UserMessage(content="hi")]), StreamOptions(api_key="k"))
+    )
+    assert captured["url"] == "https://api.minimax.io/anthropic/v1/messages"
 
 
 def test_add_cache_control_is_conservative():
