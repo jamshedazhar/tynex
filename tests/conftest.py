@@ -6,6 +6,7 @@ from typing import Any
 import pytest
 
 from tynex import http
+from tynex.ai.model_api import CATALOG_URL
 from tynex.ai.models import (
     model_from_spec,
     provider_spec,
@@ -13,9 +14,11 @@ from tynex.ai.models import (
     register_models,
     reset_custom_providers,
     reset_dynamic_models,
+    reset_provider_specs,
     resolve_model,
 )
 from tynex.ai.providers import faux
+from tynex.coding import model_catalog
 from tynex.coding import settings as paths
 from tynex.coding.model_catalog import CACHE_VERSION
 
@@ -114,12 +117,12 @@ def register_test_models() -> None:
 
 def models_cache_payload() -> dict[str, Any]:
     """Content for ``TYNEX_CONFIG_DIR/models.json``; subprocess tests write it so
-    no provider API is contacted (the cache counts as fresh)."""
+    the shared catalog counts as freshly cached (no network)."""
+    now = time.time()
     return {
         "version": CACHE_VERSION,
-        "providers": {
-            provider: {"fetchedAt": time.time(), "models": entries} for provider, entries in TEST_MODELS.items()
-        },
+        "catalog": {"url": CATALOG_URL, "fetchedAt": now},
+        "providers": {provider: {"fetchedAt": now, "models": entries} for provider, entries in TEST_MODELS.items()},
     }
 
 
@@ -190,6 +193,18 @@ def isolated_model_registry():
     yield
     reset_custom_providers()
     reset_dynamic_models()
+    reset_provider_specs()
+    model_catalog.reset_catalog_state()
+
+
+@pytest.fixture(autouse=True)
+def offline_model_catalog(monkeypatch):
+    """Never contact the catalog service or a local endpoint from the default suite."""
+    monkeypatch.setattr(model_catalog, "fetch_catalog", lambda **kwargs: {})
+    monkeypatch.setattr(model_catalog, "fetch_models", lambda *args, **kwargs: [])
+    model_catalog.reset_catalog_state()
+    yield
+    model_catalog.reset_catalog_state()
 
 
 @pytest.fixture(autouse=True)
